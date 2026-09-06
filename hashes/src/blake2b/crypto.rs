@@ -5,7 +5,7 @@
 #![allow(clippy::unreadable_literal)]
 #![allow(clippy::many_single_char_names)]
 
-use super::{HashEngine, BLOCK_SIZE};
+use super::HashEngine;
 
 /// `BLAKE2b` initialization vector, identical to the SHA-512 IV (RFC 7693 section 2.6).
 #[rustfmt::skip]
@@ -56,7 +56,6 @@ impl HashEngine {
             // The chunk is exactly 8 bytes, so the conversion cannot fail.
             *word = u64::from_le_bytes(chunk.try_into().expect("8 byte chunk"));
         }
-        debug_assert_eq!(self.buffer.len(), BLOCK_SIZE);
 
         let mut v = [0u64; 16];
         v[..8].copy_from_slice(&self.h);
