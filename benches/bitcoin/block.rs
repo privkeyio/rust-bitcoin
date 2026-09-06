@@ -50,6 +50,7 @@ fn build_test_block(num_tx: usize) -> Vec<u8> {
         time: BlockTime::from_u32(0),
         bits: CompactTarget::from_consensus(0x1d00ffff),
         nonce: 0,
+        v2: None,
     };
 
     encode_to_vec(&Block::new_unchecked(header, txs))
