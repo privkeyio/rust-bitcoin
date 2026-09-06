@@ -112,6 +112,16 @@ pub struct Params {
     pub allow_min_difficulty_blocks: bool,
     /// Determines whether retargeting is disabled for this network or not.
     pub no_pow_retargeting: bool,
+    /// Block height at which the BLAKE2b proof-of-work hardfork becomes active.
+    ///
+    /// `None` where the fork is not scheduled. From this height on, block headers may take the
+    /// extended 164 byte form and their block id is a BLAKE2b digest rather than SHA256d.
+    pub blake2b_height: Option<BlockHeight>,
+    /// One-off left shift applied to the target of the first block mined under BLAKE2b.
+    ///
+    /// A new proof-of-work algorithm arrives with far less hash rate pointed at it, so the target
+    /// is loosened once at [`Params::blake2b_height`]. Unused where the fork is not scheduled.
+    pub blake2b_target_shift: u8,
 }
 
 /// The mainnet parameters.
@@ -155,6 +165,8 @@ impl Params {
         pow_target_timespan: 14 * 24 * 60 * 60, // 2 weeks.
         allow_min_difficulty_blocks: false,
         no_pow_retargeting: false,
+        blake2b_height: Some(BlockHeight::from_u32(961640)),
+        blake2b_target_shift: 22,
     };
 
     /// The testnet3 parameters.
@@ -174,6 +186,8 @@ impl Params {
         pow_target_timespan: 14 * 24 * 60 * 60, // 2 weeks.
         allow_min_difficulty_blocks: true,
         no_pow_retargeting: false,
+        blake2b_height: None,
+        blake2b_target_shift: 20,
     };
 
     /// The testnet3 parameters.
@@ -192,6 +206,8 @@ impl Params {
         pow_target_timespan: 14 * 24 * 60 * 60, // 2 weeks.
         allow_min_difficulty_blocks: true,
         no_pow_retargeting: false,
+        blake2b_height: None,
+        blake2b_target_shift: 20,
     };
 
     /// The testnet4 parameters.
@@ -210,6 +226,8 @@ impl Params {
         pow_target_timespan: 14 * 24 * 60 * 60, // 2 weeks.
         allow_min_difficulty_blocks: true,
         no_pow_retargeting: false,
+        blake2b_height: Some(BlockHeight::from_u32(150308)),
+        blake2b_target_shift: 20,
     };
 
     /// The signet parameters.
@@ -228,6 +246,8 @@ impl Params {
         pow_target_timespan: 14 * 24 * 60 * 60, // 2 weeks.
         allow_min_difficulty_blocks: false,
         no_pow_retargeting: false,
+        blake2b_height: None,
+        blake2b_target_shift: 20,
     };
 
     /// The regtest parameters.
@@ -246,6 +266,8 @@ impl Params {
         pow_target_timespan: 14 * 24 * 60 * 60, // 2 weeks.
         allow_min_difficulty_blocks: true,
         no_pow_retargeting: true,
+        blake2b_height: None,
+        blake2b_target_shift: 20,
     };
 
     /// Constructs parameters set for the given network.

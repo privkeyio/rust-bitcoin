@@ -232,6 +232,34 @@ where
 {
     let adjustment_interval = params.difficulty_adjustment_interval();
 
+    let bits = next_target_after_inner(
+        current_header,
+        current_height,
+        params,
+        new_block_timestamp,
+        &mut get_block_header_by_height,
+        adjustment_interval,
+    )?;
+
+    // Adjust the target for the first block mined under a new proof-of-work algorithm.
+    // if (pindexLast->nHeight + 1 == params.DeploymentHeight(Consensus::DEPLOYMENT_BLAKE2B))
+    if params.blake2b_height == Some(current_height.saturating_add(1.into())) {
+        return Ok(apply_blake2b_target_shift(bits, params));
+    }
+    Ok(bits)
+}
+
+fn next_target_after_inner<F, E>(
+    current_header: Header,
+    current_height: BlockHeight,
+    params: &Params,
+    new_block_timestamp: Option<u32>,
+    get_block_header_by_height: &mut F,
+    adjustment_interval: u32,
+) -> Result<CompactTarget, E>
+where
+    F: FnMut(BlockHeight) -> Result<Header, E>,
+{
     // if ((pindexLast->nHeight+1) % params.DifficultyAdjustmentInterval() != 0)
     if !is_retarget_height(current_height.saturating_add(1.into()), adjustment_interval) {
         if params.allow_min_difficulty_blocks {
@@ -276,6 +304,27 @@ where
 /// Returns true if `height` ends the difficulty period.
 fn is_retarget_height(height: BlockHeight, adjustment_interval: u32) -> bool {
     height.to_u32() % adjustment_interval == 0
+}
+
+/// Applies the one-off target shift for the first block mined under BLAKE2b.
+///
+/// A new proof-of-work algorithm starts with far less hash rate pointed at it, so the target is
+/// loosened once at [`Params::blake2b_height`], saturating at the network's maximum.
+///
+/// Implements Bitcoin Knots' `ApplyBlake2bTargetShift`, which is shared between
+/// `GetNextWorkRequired` and `PermittedDifficultyTransition` so the target that gets produced and
+/// the one that gets accepted cannot drift apart.
+fn apply_blake2b_target_shift(bits: CompactTarget, params: &Params) -> CompactTarget {
+    let target: Target = bits.into();
+    let limit = params.max_attainable_target;
+    let shift = u32::from(params.blake2b_target_shift);
+
+    // if (bnNew > (bnPowLimit >> shift)) bnNew = bnPowLimit; else bnNew <<= shift;
+    if target.to_inner() > (limit.to_inner() >> shift) {
+        limit.to_compact_lossy()
+    } else {
+        Target::from_inner(target.to_inner() << shift).to_compact_lossy()
+    }
 }
 
 internal_macros::define_extension_trait! {
@@ -414,6 +463,91 @@ pub mod test_utils {
 
     /// Converts a `u64` to a [`Target`]
     pub fn u64_to_target(u: u64) -> Target { Target::from_inner(U256::from(u)) }
+}
+
+#[cfg(test)]
+mod blake2b_target_shift_tests {
+    use super::*;
+    use crate::block::{self, Header};
+    use crate::merkle_tree::TxMerkleNode;
+    use crate::network::params;
+    use crate::{BlockHash, BlockTime};
+
+    fn header_with_bits(bits: u32) -> Header {
+        Header {
+            version: block::Version::ONE,
+            prev_blockhash: BlockHash::from_byte_array([0; 32]),
+            merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+            time: BlockTime::from_u32(0),
+            bits: CompactTarget::from_consensus(bits),
+            nonce: 0,
+            v2: None,
+        }
+    }
+
+    fn target_after(bits: u32, height: u32, params: &Params) -> u32 {
+        next_target_after::<_, ()>(
+            header_with_bits(bits),
+            BlockHeight::from_u32(height),
+            params,
+            Some(0),
+            |_| panic!("no lookup expected off a retarget boundary"),
+        )
+        .unwrap()
+        .to_consensus_u32()
+    }
+
+    // Mainnet 961,640 is the first BLAKE2b block and is not a retarget height, so the target for
+    // it is the previous target with the one-off shift of 22 applied. Expected values computed
+    // from Bitcoin Knots' `ApplyBlake2bTargetShift` over Core's SetCompact/GetCompact.
+    #[test]
+    fn mainnet_shifts_at_the_activation_height() {
+        let params = &params::MAINNET;
+        assert_eq!(params.blake2b_height, Some(BlockHeight::from_u32(961_640)));
+        assert_eq!(params.blake2b_target_shift, 22);
+
+        assert_eq!(target_after(0x1703_098c, 961_639, params), 0x1a00_c263);
+
+        // Shifting past the network limit saturates there rather than wrapping.
+        assert_eq!(target_after(0x1b04_864c, 961_639, params), 0x1d00_ffff);
+        assert_eq!(target_after(0x1d00_ffff, 961_639, params), 0x1d00_ffff);
+        assert_eq!(target_after(0x1c0f_ffff, 961_639, params), 0x1d00_ffff);
+        // A very low target has room for the full shift.
+        assert_eq!(target_after(0x0800_ffff, 961_639, params), 0x0a3f_ffc0);
+    }
+
+    #[test]
+    fn no_shift_on_any_other_height() {
+        let params = &params::MAINNET;
+        for height in [961_637, 961_638, 961_640, 961_641] {
+            assert_eq!(target_after(0x1703_098c, height, params), 0x1703_098c, "height {}", height);
+        }
+    }
+
+    #[test]
+    fn testnet4_shifts_by_twenty() {
+        let params = &params::TESTNET4;
+        assert_eq!(params.blake2b_height, Some(BlockHeight::from_u32(150_308)));
+        assert_eq!(params.blake2b_target_shift, 20);
+        assert_eq!(target_after(0x1a05_db8b, 150_307, params), 0x1c5d_b8b0);
+        assert_eq!(target_after(0x1a05_db8b, 150_306, params), 0x1a05_db8b);
+    }
+
+    #[test]
+    fn networks_without_the_fork_never_shift() {
+        for params in [&params::TESTNET3, &params::SIGNET, &params::REGTEST] {
+            assert_eq!(params.blake2b_height, None);
+            for height in [0, 150_307, 961_639, u32::MAX - 1] {
+                assert_eq!(
+                    target_after(0x1703_098c, height, params),
+                    0x1703_098c,
+                    "{:?} height {}",
+                    params.network,
+                    height
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
