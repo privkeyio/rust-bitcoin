@@ -2708,6 +2708,35 @@ mod tests {
     #[cfg(feature = "alloc")]
     #[cfg(feature = "hex")]
     #[cfg(feature = "serde")]
+    fn can_serde_as_consensus_extended_header() {
+        // Wallets persist headers through `serde_as_consensus`, so the extended form has to
+        // survive that round trip too. `profile_0_time_offset` from Bitcoin Knots'
+        // `src/test/data/block_header_v2.json` at tag v29.4.1.knots20260508.
+        const WIRE: &str = "000000a01f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070605040302010000112233445566778899aabbccddeeff00102030405060708090a0b0c0d0e0f0a8913577ffff001d0df0ad0b44332211efcdab89ffeeddccbbaa998877665544332211005802000003001c000000000000000000000000000000000040d10c008967452301efcdab8967452301efcdab8967452301efcdab8967452301efcdab";
+
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        struct Wrapper {
+            #[serde(with = "encoding::serde_as_consensus")]
+            header: Header,
+        }
+
+        let orig = Wrapper { header: WIRE.parse().expect("valid extended header") };
+        assert!(orig.header.v2.is_some());
+
+        let json = serde_json::to_string(&orig).expect("failed to serialize");
+        assert_eq!(json, alloc::format!("{{\"header\":\"{}\"}}", WIRE));
+        let roundtrip: Wrapper = serde_json::from_str(&json).expect("failed to deserialize");
+        assert_eq!(roundtrip, orig);
+
+        let bytes = bincode::serialize(&orig).expect("failed to serialize");
+        let roundtrip: Wrapper = bincode::deserialize(&bytes).expect("failed to deserialize");
+        assert_eq!(roundtrip, orig);
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    #[cfg(feature = "hex")]
+    #[cfg(feature = "serde")]
     fn can_serde_as_consensus_bincode() {
         let orig = Adt { header: dummy_header(), block: dummy_block() };
 
