@@ -1,3 +1,4 @@
+
 // SPDX-License-Identifier: CC0-1.0
 
 //! A `headers` message may mix legacy and extended block headers.
@@ -5,6 +6,9 @@
 //! Past the `BLAKE2b` proof-of-work hardfork the entries in a `headers` message are no longer a
 //! fixed width, so a peer can send 80 and 164 byte headers in the same message and a reader has
 //! to take the length from each header's own version word.
+
+// `bitcoin_p2p_messages::message` is gated on `std`, so this test cannot build without it.
+#![cfg(feature = "std")]
 
 use bitcoin_p2p_messages::message::{HeadersMessage, NetworkHeader};
 use hex::hex;
