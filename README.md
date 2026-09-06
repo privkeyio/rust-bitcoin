@@ -1,3 +1,50 @@
+# rust-bitcoin with BLAKE2b proof of work
+
+This is an unofficial fork of [rust-bitcoin](https://github.com/rust-bitcoin/rust-bitcoin) that follows the BLAKE2b proof-of-work hardfork of Bitcoin. It is not affiliated with the rust-bitcoin project. Upstream tracks Bitcoin Core consensus and has not adopted the fork, so use upstream instead if that is what you want.
+
+> **Not reviewed by upstream.** It holds no keys and no funds, but wallets trust it for chain data, so a bug in header parsing or the block id means they follow the wrong chain. Everything below the divider is upstream's documentation and describes rust-bitcoin rather than this fork.
+
+## What differs from upstream
+
+- **The extended block header.** `Header` gains an optional `HeaderV2` carrying the 84 bytes an extended header adds to the historical 80. A header announces its own form through bit 31 of the version word, so no activation height is compiled in and nothing keys off the block height.
+- **BLAKE2b block ids.** `Header::block_hash()` dispatches: SHA256d for the legacy form, and for the extended form the tagged-hash pipeline and two BLAKE2b passes that Bitcoin Knots uses, laid out by the ASIC profile in the header flags. BLAKE2b-256 is implemented in `bitcoin::crypto::blake2b` rather than in `bitcoin_hashes`, so a downstream user patches one crate rather than two.
+- **Bit 31 is no longer part of the version.** `Version::from_consensus` masks it off, by every construction path including `Deserialize`, so a header cannot be built that serializes as something other than the value it was made from.
+- **Size and weight read the header's real length.** A block carrying an extended header is 84 bytes and 336 weight units larger, which matters because weight gates validity.
+- **Header form validation.** `Header::validate_form` and `validate_form_at_height` carry the four rules Knots enforces, so a header syncing client can apply them without building a `Block`.
+
+## Branches
+
+| Branch | Base | Use |
+| --- | --- | --- |
+| `master` | upstream `master` | The 0.33 line. For when the ecosystem moves off 0.32. |
+| `0.32.xx` | upstream `0.32.xx` | The 0.32 line. This is what bdk, bdk_wallet and electrum-client pin, so it is the one in use today. |
+
+Releases are tagged so a dependent can pin an immutable rev: a moving branch would let consensus code change under a fresh clone.
+
+## Activation
+
+| Network | Height |
+| --- | --- |
+| mainnet | 961,640 |
+| testnet4 | 150,308 |
+
+Listed for reference. Parsing keys off the header itself rather than a height, so it needs no updating if these change. `Params` carries them for the rules that genuinely need chain context.
+
+## Verification
+
+The extended header and its block id are checked against Bitcoin Knots' own test data at tag `v29.4.1.knots20260508`, covering all four ASIC layout profiles, and against 25,000 randomized headers generated from an independent transcription of Knots' `CBlockHeader::GetHash`. The decoder is fuzzed, and the whole chain is verified against a live Knots-backed Electrum server.
+
+## Using it
+
+```toml
+[patch.crates-io]
+bitcoin = { git = "https://github.com/privkeyio/rust-bitcoin", rev = "<pinned rev>" }
+```
+
+Cargo honours `[patch]` only in the workspace root being built, so every consumer supplies its own.
+
+---
+
 <div align="center">
   <h1>Rust Bitcoin</h1>
 
