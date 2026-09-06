@@ -34,8 +34,8 @@ pub use units::block::{
 #[doc(no_inline)]
 pub use self::error::{
     Bip34Error, BlockDecoderError, BlockHashDecoderError, BlockHeightDecoderError,
-    HeaderDecoderError, InvalidBlockError, TooBigForRelativeHeightError, ValidationError,
-    VersionDecoderError,
+    HeaderDecoderError, InvalidBlockError, InvalidHeaderFormError, TooBigForRelativeHeightError,
+    ValidationError, VersionDecoderError,
 };
 
 #[deprecated(since = "TBD", note = "use `BlockHeightInterval` instead")]
@@ -77,6 +77,73 @@ internal_macros::define_extension_trait! {
 
         /// Returns the total work of the block.
         fn work(&self) -> Work { self.target().to_work() }
+
+        /// Checks the rules the BLAKE2b hardfork places on the header form.
+        ///
+        /// Implements the part of Bitcoin Knots' `CheckBlockHeader` that needs nothing but the
+        /// header itself: an extended header may not claim a height below the activation, and the
+        /// top two flag bits are reserved for a future hardfork.
+        ///
+        /// This is what a header syncing client can check on its own. The remaining rules compare
+        /// the header against the height the block actually sits at, so they need chain context;
+        /// see [`HeaderExt::validate_form_at_height`].
+        ///
+        /// # Errors
+        ///
+        /// [`InvalidHeaderFormError`] if the header breaks either rule.
+        fn validate_form(&self, params: impl AsRef<Params>) -> Result<(), InvalidHeaderFormError> {
+            let params = params.as_ref();
+            let Some(v2) = self.v2 else { return Ok(()) };
+
+            // if (!consensusParams.IsBlake2bHeight(block.m_height)) -> bad-version-sha256d
+            let activation = params.blake2b_height.ok_or(InvalidHeaderFormError::ExtendedHeaderNotScheduled)?;
+            if v2.height < 0 || BlockHeight::from_u32(v2.height.unsigned_abs()) < activation {
+                return Err(InvalidHeaderFormError::ExtendedHeaderTooEarly);
+            }
+
+            // if (block.m_flags & 0xc0) -> bad-flags-highbits
+            if v2.flags & HeaderV2::RESERVED_FLAGS != 0 {
+                return Err(InvalidHeaderFormError::ReservedFlags);
+            }
+
+            Ok(())
+        }
+
+        /// Checks the header form against the height the block actually sits at.
+        ///
+        /// Implements Knots' `bad-header-height` and `bad-version-blake2b` on top of
+        /// [`HeaderExt::validate_form`]: an extended header must agree with its real height, and
+        /// from the activation height on a legacy header is no longer accepted.
+        ///
+        /// `height` must come from the chain, not from the header, since agreeing with itself is
+        /// exactly what this checks.
+        ///
+        /// # Errors
+        ///
+        /// [`InvalidHeaderFormError`] if the header breaks any of the rules.
+        fn validate_form_at_height(
+            &self,
+            height: BlockHeight,
+            params: impl AsRef<Params>,
+        ) -> Result<(), InvalidHeaderFormError> {
+            let params = params.as_ref();
+            self.validate_form(params)?;
+
+            match self.v2 {
+                // if (block.m_height != height) -> bad-header-height
+                Some(v2) =>
+                    if v2.height < 0 || BlockHeight::from_u32(v2.height.unsigned_abs()) != height {
+                        return Err(InvalidHeaderFormError::HeightMismatch);
+                    },
+                // if (consensusParams.IsBlake2bHeight(height)) -> bad-version-blake2b
+                None =>
+                    if params.blake2b_height.is_some_and(|activation| height >= activation) {
+                        return Err(InvalidHeaderFormError::LegacyHeaderTooLate);
+                    },
+            }
+
+            Ok(())
+        }
     }
 }
 
@@ -223,6 +290,47 @@ pub mod error {
     #[doc(no_inline)]
     pub use units::block::{BlockHeightDecoderError, TooBigForRelativeHeightError};
 
+    /// An error validating the form of a block header against the BLAKE2b hardfork rules.
+    ///
+    /// See [`HeaderExt::validate_form`] and [`HeaderExt::validate_form_at_height`].
+    ///
+    /// [`HeaderExt::validate_form`]: super::HeaderExt::validate_form
+    /// [`HeaderExt::validate_form_at_height`]: super::HeaderExt::validate_form_at_height
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub enum InvalidHeaderFormError {
+        /// An extended header appeared on a network where the hardfork is not scheduled.
+        ExtendedHeaderNotScheduled,
+        /// An extended header claims a height below the activation height.
+        ExtendedHeaderTooEarly,
+        /// A legacy header appeared at or after the activation height.
+        LegacyHeaderTooLate,
+        /// The height in an extended header does not match the height of the block.
+        HeightMismatch,
+        /// The header sets flag bits reserved for a future hardfork.
+        ReservedFlags,
+    }
+
+    impl fmt::Display for InvalidHeaderFormError {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            match *self {
+                Self::ExtendedHeaderNotScheduled =>
+                    write!(f, "extended block header on a network without the BLAKE2b hardfork"),
+                Self::ExtendedHeaderTooEarly =>
+                    write!(f, "extended block header below the BLAKE2b activation height"),
+                Self::LegacyHeaderTooLate =>
+                    write!(f, "legacy block header at or after the BLAKE2b activation height"),
+                Self::HeightMismatch =>
+                    write!(f, "height in the block header does not match the height of the block"),
+                Self::ReservedFlags =>
+                    write!(f, "block header sets flag bits reserved for a future hardfork"),
+            }
+        }
+    }
+
+    #[cfg(feature = "std")]
+    impl std::error::Error for InvalidHeaderFormError {}
+
     /// An error when looking up a BIP-0034 block height.
     #[derive(Debug, Clone, PartialEq, Eq)]
     #[non_exhaustive]
@@ -329,6 +437,106 @@ mod tests {
     use crate::{
         block, Amount, BlockTime, CompactTarget, Network, Sequence, TestnetVersion, Witness, Wtxid,
     };
+
+    fn v2_header(height: i32, flags: u8) -> Header {
+        Header {
+            version: block::Version::ONE,
+            prev_blockhash: BlockHash::from_byte_array([0; 32]),
+            merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+            time: BlockTime::from_u32(0),
+            bits: CompactTarget::from_consensus(0x1d00_ffff),
+            nonce: 0,
+            v2: Some(block::HeaderV2 {
+                nonce2: 0,
+                nonce3: 0,
+                extranonce: [0; 16],
+                time_offset: 0,
+                txcount: 1,
+                flags,
+                xor_key_mask_clear_bits: 0,
+                xor_key: [0; 16],
+                height,
+                mm_rhs: [0; 32],
+            }),
+        }
+    }
+
+    #[test]
+    fn validate_form_enforces_the_activation_height() {
+        use crate::network::params;
+        let params = &params::MAINNET;
+
+        // Knots' bad-version-sha256d: an extended header may not claim a height below activation.
+        assert_eq!(v2_header(961_640, 0).validate_form(params), Ok(()));
+        assert_eq!(v2_header(961_641, 0).validate_form(params), Ok(()));
+        assert_eq!(
+            v2_header(961_639, 0).validate_form(params),
+            Err(InvalidHeaderFormError::ExtendedHeaderTooEarly)
+        );
+        assert_eq!(
+            v2_header(0, 0).validate_form(params),
+            Err(InvalidHeaderFormError::ExtendedHeaderTooEarly)
+        );
+        // A negative height cannot be at or above the activation.
+        assert_eq!(
+            v2_header(-1, 0).validate_form(params),
+            Err(InvalidHeaderFormError::ExtendedHeaderTooEarly)
+        );
+        assert_eq!(
+            v2_header(i32::MIN, 0).validate_form(params),
+            Err(InvalidHeaderFormError::ExtendedHeaderTooEarly)
+        );
+
+        // Knots' bad-flags-highbits.
+        for flags in [0x40, 0x80, 0xc0] {
+            assert_eq!(
+                v2_header(961_640, flags).validate_form(params),
+                Err(InvalidHeaderFormError::ReservedFlags),
+                "flags {:#04x}",
+                flags
+            );
+        }
+
+        // Where the fork is not scheduled, an extended header has no valid height at all.
+        assert_eq!(
+            v2_header(961_640, 0).validate_form(&params::SIGNET),
+            Err(InvalidHeaderFormError::ExtendedHeaderNotScheduled)
+        );
+
+        // A legacy header is unaffected on every network.
+        let v1 = Header { v2: None, ..v2_header(0, 0) };
+        assert_eq!(v1.validate_form(params), Ok(()));
+        assert_eq!(v1.validate_form(&params::SIGNET), Ok(()));
+    }
+
+    #[test]
+    fn validate_form_at_height_enforces_the_flag_day() {
+        use crate::network::params;
+        let params = &params::MAINNET;
+        let at = |h: u32| BlockHeight::from_u32(h);
+
+        // Knots' bad-header-height: the header must agree with where the block sits.
+        assert_eq!(v2_header(961_640, 0).validate_form_at_height(at(961_640), params), Ok(()));
+        assert_eq!(
+            v2_header(961_641, 0).validate_form_at_height(at(961_640), params),
+            Err(InvalidHeaderFormError::HeightMismatch)
+        );
+
+        // Knots' bad-version-blake2b: a legacy header is refused from the activation height on.
+        let v1 = Header { v2: None, ..v2_header(0, 0) };
+        assert_eq!(v1.validate_form_at_height(at(961_639), params), Ok(()));
+        assert_eq!(
+            v1.validate_form_at_height(at(961_640), params),
+            Err(InvalidHeaderFormError::LegacyHeaderTooLate)
+        );
+        assert_eq!(
+            v1.validate_form_at_height(at(1_000_000), params),
+            Err(InvalidHeaderFormError::LegacyHeaderTooLate)
+        );
+
+        // And a legacy header stays valid at any height where the fork is unscheduled.
+        assert_eq!(v1.validate_form_at_height(at(961_640), &params::SIGNET), Ok(()));
+    }
 
     #[test]
     fn extended_header_counts_toward_block_size_and_weight() {
