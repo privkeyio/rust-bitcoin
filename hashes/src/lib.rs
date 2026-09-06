@@ -88,6 +88,7 @@ pub mod _export {
 
 mod internal_macros;
 
+pub mod blake2b;
 pub mod cmp;
 pub mod hash160;
 pub mod hkdf;
