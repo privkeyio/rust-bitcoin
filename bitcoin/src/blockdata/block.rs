@@ -76,20 +76,412 @@ pub struct Header {
     pub bits: CompactTarget,
     /// The nonce, selected to obtain a low enough blockhash.
     pub nonce: u32,
+    /// The extra fields carried by an extended header, if this is one.
+    ///
+    /// `None` for the historical 80 byte form. See [`HeaderV2`].
+    pub v2: Option<HeaderV2>,
 }
 
-impl_consensus_encoding!(Header, version, prev_blockhash, merkle_root, time, bits, nonce);
+/// The extra fields carried by an extended (164 byte) block header.
+///
+/// After the BLAKE2b proof-of-work hardfork a header may carry 84 bytes beyond the historical 80.
+/// The extended form is announced by bit 31 of the header's version word, so a header is
+/// self-describing and nothing keys off the block height. Below the activation height headers stay
+/// 80 bytes and byte identical to what they always were.
+///
+/// The blob fields are held in wire (little endian) byte order, the same way [`BlockHash`] holds
+/// its bytes.
+#[derive(Copy, PartialEq, Eq, Clone, Debug, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
+pub struct HeaderV2 {
+    /// Second nonce, ground directly by the mining hardware.
+    pub nonce2: u32,
+    /// Third nonce, ground directly by the mining hardware.
+    pub nonce3: u32,
+    /// Stratum v1 extranonce.
+    pub extranonce: [u8; 16],
+    /// Amount added to the time on the wire to obtain [`Header::time`].
+    ///
+    /// Only applied when [`HeaderV2::USE_TIME_OFFSET`] is set in [`HeaderV2::flags`], but the
+    /// field is always present on the wire and always committed to by the block hash.
+    pub time_offset: u32,
+    /// Number of transactions in the block.
+    pub txcount: u16,
+    /// Header flags. The low two bits select the ASIC layout profile used by the block hash.
+    pub flags: u8,
+    /// Number of leading bits of the XOR mask to clear.
+    pub xor_key_mask_clear_bits: u8,
+    /// Proof-of-work XOR key.
+    pub xor_key: [u8; 16],
+    /// Height of this block.
+    pub height: i32,
+    /// Right hand side of the merge-mining hook.
+    pub mm_rhs: [u8; 32],
+}
+
+impl HeaderV2 {
+    /// Bit in [`HeaderV2::flags`] that makes [`HeaderV2::time_offset`] apply to the wire time.
+    pub const USE_TIME_OFFSET: u8 = 4;
+
+    /// Bits of [`HeaderV2::flags`] reserved for a future hardfork.
+    ///
+    /// These serve the same purpose for a future format change that version bit 31 served for
+    /// this one, so a header that sets either of them must be rejected rather than hashed with
+    /// today's algorithm. See [`Header::validate_form`].
+    pub const RESERVED_FLAGS: u8 = 0xc0;
+
+    /// The number of bytes an extended header adds to [`Header::SIZE`].
+    // (nonce2, nonce3, extranonce, time_offset, txcount, flags, xor_key_mask_clear_bits, xor_key,
+    // height, mm_rhs)
+    pub const EXTRA_SIZE: usize = 4 + 4 + 16 + 4 + 2 + 1 + 1 + 16 + 4 + 32; // 84
+
+    /// Returns the ASIC layout profile, which selects how the second BLAKE2b input is laid out.
+    pub const fn asic_profile(&self) -> u8 { self.flags & 3 }
+
+    fn to_extra_bytes(self) -> [u8; Self::EXTRA_SIZE] {
+        let mut out = [0u8; Self::EXTRA_SIZE];
+        out[0..4].copy_from_slice(&self.nonce2.to_le_bytes());
+        out[4..8].copy_from_slice(&self.nonce3.to_le_bytes());
+        out[8..24].copy_from_slice(&self.extranonce);
+        out[24..28].copy_from_slice(&self.time_offset.to_le_bytes());
+        out[28..30].copy_from_slice(&self.txcount.to_le_bytes());
+        out[30] = self.flags;
+        out[31] = self.xor_key_mask_clear_bits;
+        out[32..48].copy_from_slice(&self.xor_key);
+        out[48..52].copy_from_slice(&self.height.to_le_bytes());
+        out[52..84].copy_from_slice(&self.mm_rhs);
+        out
+    }
+
+    fn from_extra_bytes(buf: &[u8; Self::EXTRA_SIZE]) -> Self {
+        // Every slice below is a fixed sub-range of a fixed size array, so no conversion can fail.
+        HeaderV2 {
+            nonce2: u32::from_le_bytes(buf[0..4].try_into().expect("4 bytes")),
+            nonce3: u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes")),
+            extranonce: buf[8..24].try_into().expect("16 bytes"),
+            time_offset: u32::from_le_bytes(buf[24..28].try_into().expect("4 bytes")),
+            txcount: u16::from_le_bytes(buf[28..30].try_into().expect("2 bytes")),
+            flags: buf[30],
+            xor_key_mask_clear_bits: buf[31],
+            xor_key: buf[32..48].try_into().expect("16 bytes"),
+            height: i32::from_le_bytes(buf[48..52].try_into().expect("4 bytes")),
+            mm_rhs: buf[52..84].try_into().expect("32 bytes"),
+        }
+    }
+}
+
+impl Encodable for Header {
+    fn consensus_encode<W: io::Write + ?Sized>(&self, w: &mut W) -> Result<usize, io::Error> {
+        let mut len = 0;
+        len += self.complete_version().consensus_encode(w)?;
+        len += self.prev_blockhash.consensus_encode(w)?;
+        len += self.merkle_root.consensus_encode(w)?;
+        len += self.time_on_wire().consensus_encode(w)?;
+        len += self.bits.consensus_encode(w)?;
+        len += self.nonce.consensus_encode(w)?;
+        if let Some(v2) = self.v2 {
+            let extra = v2.to_extra_bytes();
+            w.write_all(&extra)?;
+            len += extra.len();
+        }
+        Ok(len)
+    }
+}
+
+impl Decodable for Header {
+    fn consensus_decode_from_finite_reader<R: io::Read + ?Sized>(
+        r: &mut R,
+    ) -> Result<Header, encode::Error> {
+        // The wire form is self-describing: bit 31 of the version word says whether the extended
+        // fields follow, so the length is only known after the first four bytes.
+        let complete_version = u32::consensus_decode_from_finite_reader(r)?;
+        let prev_blockhash = BlockHash::consensus_decode_from_finite_reader(r)?;
+        let merkle_root = TxMerkleNode::consensus_decode_from_finite_reader(r)?;
+        let wire_time = u32::consensus_decode_from_finite_reader(r)?;
+        let bits = CompactTarget::consensus_decode_from_finite_reader(r)?;
+        let nonce = u32::consensus_decode_from_finite_reader(r)?;
+
+        let v2 = if complete_version & Header::V2_VERSION_FLAG != 0 {
+            let mut extra = [0u8; HeaderV2::EXTRA_SIZE];
+            r.read_exact(&mut extra)?;
+            Some(HeaderV2::from_extra_bytes(&extra))
+        } else {
+            None
+        };
+
+        // Past the hardfork bit 31 announces the header form rather than belonging to the
+        // version, and `Version::from_consensus` masks it off.
+        // The cast reinterprets the bits; `Version` is signed only for historical reasons.
+        let version = Version::from_consensus(complete_version as i32);
+
+        // `time` on the wire is the effective time less the offset, when the offset is in use.
+        let time = match v2 {
+            Some(v2) if v2.flags & HeaderV2::USE_TIME_OFFSET != 0 =>
+                wire_time.wrapping_add(v2.time_offset),
+            _ => wire_time,
+        };
+
+        Ok(Header { version, prev_blockhash, merkle_root, time, bits, nonce, v2 })
+    }
+
+    fn consensus_decode<R: io::Read + ?Sized>(r: &mut R) -> Result<Header, encode::Error> {
+        let mut r = r.take(encode::MAX_VEC_SIZE as u64);
+        Self::consensus_decode_from_finite_reader(&mut r)
+    }
+}
 
 impl Header {
     /// The number of bytes that the block header contributes to the size of a block.
     // Serialized length of fields (version, prev_blockhash, merkle_root, time, bits, nonce)
     pub const SIZE: usize = 4 + 32 + 32 + 4 + 4 + 4; // 80
 
+    /// The number of bytes that an extended block header contributes to the size of a block.
+    pub const V2_SIZE: usize = Self::SIZE + HeaderV2::EXTRA_SIZE; // 164
+
+    /// Bit of the version word that announces the extended header form.
+    pub const V2_VERSION_FLAG: u32 = 0x8000_0000;
+
     /// Returns the block hash.
     pub fn block_hash(&self) -> BlockHash {
-        let mut engine = BlockHash::engine();
-        self.consensus_encode(&mut engine).expect("engines don't error");
-        BlockHash::from_engine(engine)
+        match self.v2 {
+            None => {
+                let mut engine = BlockHash::engine();
+                self.consensus_encode(&mut engine).expect("engines don't error");
+                BlockHash::from_engine(engine)
+            }
+            Some(ref v2) => self.block_hash_v2(v2),
+        }
+    }
+
+    /// Returns the serialized size of this header, in bytes.
+    ///
+    /// Either [`Header::SIZE`] or [`Header::V2_SIZE`].
+    pub const fn size(&self) -> usize {
+        match self.v2 {
+            None => Self::SIZE,
+            Some(_) => Self::V2_SIZE,
+        }
+    }
+
+    /// Returns the version word as it appears on the wire.
+    ///
+    /// This is [`Header::version`] with [`Header::V2_VERSION_FLAG`] set if and only if this is an
+    /// extended header. `Version` never carries bit 31 itself.
+    pub const fn complete_version(&self) -> u32 {
+        // The cast reinterprets the bits; `Version` is signed only for historical reasons.
+        let base = self.version.0 as u32 & !Self::V2_VERSION_FLAG;
+        match self.v2 {
+            None => base,
+            Some(_) => base | Self::V2_VERSION_FLAG,
+        }
+    }
+
+    /// Returns the timestamp as it appears on the wire.
+    ///
+    /// [`Header::time`] holds the effective block time. An extended header may carry part of it in
+    /// [`HeaderV2::time_offset`] instead, in which case the wire form holds the difference.
+    pub const fn time_on_wire(&self) -> u32 {
+        match self.v2 {
+            Some(v2) if v2.flags & HeaderV2::USE_TIME_OFFSET != 0 =>
+                self.time.wrapping_sub(v2.time_offset),
+            _ => self.time,
+        }
+    }
+
+    /// Computes the BLAKE2b block id of an extended header.
+    ///
+    /// Follows Bitcoin Knots' `CBlockHeader::GetHash` for the extended form: a chain of BIP-340
+    /// style tagged SHA256 hashes feeding two BLAKE2b passes, the second laid out according to the
+    /// ASIC profile in the header flags, then masked and byte reversed.
+    fn block_hash_v2(&self, v2: &HeaderV2) -> BlockHash {
+        use hashes::{sha256, Hash as _, HashEngine as _};
+
+        use crate::crypto::blake2b::Blake2b256;
+
+        /// BIP-340 style tagged hash engine, seeded with `sha256(tag)` twice.
+        fn tagged(tag: &[u8]) -> sha256::HashEngine {
+            let tag_hash = sha256::Hash::hash(tag);
+            let mut engine = sha256::Hash::engine();
+            engine.input(tag_hash.as_byte_array());
+            engine.input(tag_hash.as_byte_array());
+            engine
+        }
+
+        const ZEROS: [u8; 16] = [0; 16];
+
+        // The pooling miner only learns the XOR key once it finds a block, so the header commits
+        // to the key's hash rather than the key.
+        let mut engine = tagged(b"Bitcoin block hash PoW XOR key");
+        engine.input(&v2.xor_key);
+        let xor_key_hash = sha256::Hash::from_engine(engine);
+
+        let mut xor_key_mask = [0u8; 32];
+        if v2.xor_key != ZEROS {
+            let mut engine = tagged(b"Bitcoin block hash PoW XOR mask");
+            engine.input(&v2.xor_key);
+            xor_key_mask = sha256::Hash::from_engine(engine).to_byte_array();
+            // `xor_key_mask_clear_bits` is a `u8`, so this is at most 31 and stays in bounds.
+            let clear_bytes = usize::from(v2.xor_key_mask_clear_bits / 8);
+            xor_key_mask[..clear_bytes].fill(0);
+            xor_key_mask[clear_bytes] &= 0xff_u8 >> (v2.xor_key_mask_clear_bits % 8);
+        }
+
+        let mut prev_blockhash = self.prev_blockhash.to_byte_array();
+        prev_blockhash.reverse();
+
+        let mut engine = tagged(b"Bitcoin prevblock header, hashed");
+        engine.input(&prev_blockhash);
+        let mut prev_blockhash_hidden = sha256::Hash::from_engine(engine).to_byte_array();
+
+        // These fields are invisible to the mining machine, so the hasher cannot brick itself at
+        // some future block version, time or difficulty.
+        let mut h1 = tagged(b"Bitcoin block header 1");
+        h1.input(&self.complete_version().to_le_bytes());
+        h1.input(&prev_blockhash);
+        h1.input(&v2.height.to_le_bytes());
+        h1.input(&self.merkle_root.to_byte_array());
+        h1.input(&self.time_on_wire().to_le_bytes());
+        h1.input(&[0]); // Reserved for an extended 40 bit time.
+        h1.input(&self.bits.to_consensus().to_le_bytes());
+        h1.input(&u32::from(v2.txcount).to_le_bytes());
+        h1.input(&[v2.flags, v2.xor_key_mask_clear_bits]);
+        h1.input(xor_key_hash.as_byte_array());
+
+        let mut h2 = tagged(b"Merge-mining hook");
+        h2.input(sha256::Hash::from_engine(h1).as_byte_array());
+        h2.input(&ZEROS);
+        h2.input(&ZEROS);
+        h2.input(&v2.mm_rhs);
+        let h2_hash = sha256::Hash::from_engine(h2).to_byte_array();
+
+        // These fields get sent to mining machines over Stratum v1.
+        let mut engine = Blake2b256::new();
+        engine.input(&0_u32.to_le_bytes()); // Sv1 "coinb1", less the implied first byte.
+        engine.input(&h2_hash);
+        engine.input(&v2.extranonce);
+        let hash = engine.finalize();
+
+        // Presumably the actual mining ASIC hardware sees these.
+        //
+        // Profiles 0, 2 and 3 end with the same five fields. Profile 1 deliberately swaps
+        // `nonce3` and `time_offset`, so it is written out separately below.
+        let tail = |engine: &mut Blake2b256| {
+            engine.input(&self.nonce.to_le_bytes());
+            engine.input(&v2.nonce2.to_le_bytes());
+            engine.input(&v2.time_offset.to_le_bytes());
+            engine.input(&v2.nonce3.to_le_bytes());
+            engine.input(&hash);
+        };
+
+        let mut engine = Blake2b256::new();
+        match v2.asic_profile() {
+            profile @ (2 | 3) => {
+                if profile == 3 {
+                    engine.input(&ZEROS);
+                    engine.input(&ZEROS);
+                }
+                engine.input(&ZEROS);
+                engine.input(&ZEROS);
+                engine.input(&ZEROS);
+                engine.input(&h2_hash);
+                tail(&mut engine);
+            }
+            0 => {
+                prev_blockhash_hidden[..6].fill(0);
+                engine.input(&prev_blockhash_hidden);
+                tail(&mut engine);
+            }
+            // The profile is `flags & 3`, so 1 is the only value left.
+            _ => {
+                engine.input(&self.nonce.to_le_bytes());
+                engine.input(&v2.nonce2.to_le_bytes());
+                engine.input(&v2.nonce3.to_le_bytes());
+                engine.input(&v2.time_offset.to_le_bytes());
+                engine.input(&hash);
+                engine.input(&h2_hash);
+            }
+        }
+        let hash = engine.finalize();
+
+        // Knots writes the masked digest into the block id back to front. That is exactly the
+        // order `BlockHash` stores its bytes in, so the displayed id reads the digest forwards.
+        let mut out = [0u8; 32];
+        for (i, byte) in hash.iter().enumerate() {
+            out[31 - i] = byte ^ xor_key_mask[i];
+        }
+        BlockHash::from_byte_array(out)
+    }
+
+    /// Checks the rules the BLAKE2b hardfork places on the header form.
+    ///
+    /// Implements the part of Bitcoin Knots' `CheckBlockHeader` that needs nothing but the header
+    /// itself: an extended header may not claim a height below the activation, and the top two
+    /// flag bits are reserved for a future hardfork.
+    ///
+    /// This is what a header syncing client can check on its own. The remaining rules compare the
+    /// header against the height the block actually sits at, so they need chain context; see
+    /// [`Header::validate_form_at_height`].
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidHeaderFormError`] if the header breaks either rule.
+    pub fn validate_form(&self, params: impl AsRef<Params>) -> Result<(), InvalidHeaderFormError> {
+        let params = params.as_ref();
+        let v2 = match self.v2 {
+            Some(v2) => v2,
+            None => return Ok(()),
+        };
+
+        // if (!consensusParams.IsBlake2bHeight(block.m_height)) -> bad-version-sha256d
+        let activation =
+            params.blake2b_height.ok_or(InvalidHeaderFormError::ExtendedHeaderNotScheduled)?;
+        if v2.height < 0 || v2.height.unsigned_abs() < activation {
+            return Err(InvalidHeaderFormError::ExtendedHeaderTooEarly);
+        }
+
+        // if (block.m_flags & 0xc0) -> bad-flags-highbits
+        if v2.flags & HeaderV2::RESERVED_FLAGS != 0 {
+            return Err(InvalidHeaderFormError::ReservedFlags);
+        }
+
+        Ok(())
+    }
+
+    /// Checks the header form against the height the block actually sits at.
+    ///
+    /// Implements Knots' `bad-header-height` and `bad-version-blake2b` on top of
+    /// [`Header::validate_form`]: an extended header must agree with its real height, and from
+    /// the activation height on a legacy header is no longer accepted.
+    ///
+    /// `height` must come from the chain, not from the header, since agreeing with itself is
+    /// exactly what this checks.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidHeaderFormError`] if the header breaks any of the rules.
+    pub fn validate_form_at_height(
+        &self,
+        height: u32,
+        params: impl AsRef<Params>,
+    ) -> Result<(), InvalidHeaderFormError> {
+        let params = params.as_ref();
+        self.validate_form(params)?;
+
+        match self.v2 {
+            // if (block.m_height != height) -> bad-header-height
+            Some(v2) =>
+                if v2.height < 0 || v2.height.unsigned_abs() != height {
+                    return Err(InvalidHeaderFormError::HeightMismatch);
+                },
+            // if (consensusParams.IsBlake2bHeight(height)) -> bad-version-blake2b
+            None =>
+                if params.blake2b_height.map_or(false, |a| height >= a) {
+                    return Err(InvalidHeaderFormError::LegacyHeaderTooLate);
+                },
+        }
+
+        Ok(())
     }
 
     /// Computes the target (range [0, T] inclusive) that a blockhash must land in to be valid.
@@ -138,6 +530,44 @@ impl fmt::Debug for Header {
     }
 }
 
+/// An error validating the form of a block header against the BLAKE2b hardfork rules.
+///
+/// See [`Header::validate_form`] and [`Header::validate_form_at_height`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvalidHeaderFormError {
+    /// An extended header appeared on a network where the hardfork is not scheduled.
+    ExtendedHeaderNotScheduled,
+    /// An extended header claims a height below the activation height.
+    ExtendedHeaderTooEarly,
+    /// A legacy header appeared at or after the activation height.
+    LegacyHeaderTooLate,
+    /// The height in an extended header does not match the height of the block.
+    HeightMismatch,
+    /// The header sets flag bits reserved for a future hardfork.
+    ReservedFlags,
+}
+
+impl fmt::Display for InvalidHeaderFormError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Self::ExtendedHeaderNotScheduled =>
+                write!(f, "extended block header on a network without the BLAKE2b hardfork"),
+            Self::ExtendedHeaderTooEarly =>
+                write!(f, "extended block header below the BLAKE2b activation height"),
+            Self::LegacyHeaderTooLate =>
+                write!(f, "legacy block header at or after the BLAKE2b activation height"),
+            Self::HeightMismatch =>
+                write!(f, "height in the block header does not match the height of the block"),
+            Self::ReservedFlags =>
+                write!(f, "block header sets flag bits reserved for a future hardfork"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for InvalidHeaderFormError {}
+
 /// Bitcoin block version number.
 ///
 /// Originally used as a protocol version, but repurposed for soft-fork signaling.
@@ -178,7 +608,13 @@ impl Version {
     ///
     /// This is the data type used in consensus code in Bitcoin Core.
     #[inline]
-    pub const fn from_consensus(v: i32) -> Self { Version(v) }
+    ///
+    /// Bit 31 is masked off: past the BLAKE2b hardfork it announces the extended header form
+    /// rather than belonging to the version, so `from_consensus(i32::MIN)` is zero.
+    pub const fn from_consensus(v: i32) -> Self {
+        // The casts reinterpret the bits; `Version` is signed only for historical reasons.
+        Version((v as u32 & !Header::V2_VERSION_FLAG) as i32)
+    }
 
     /// Returns the inner `i32` value.
     ///
@@ -339,7 +775,8 @@ impl Block {
     /// > Base size is the block size in bytes with the original transaction serialization without
     /// > any witness-related data, as seen by a non-upgraded node.
     fn base_size(&self) -> usize {
-        let mut size = Header::SIZE;
+        // An extended header is longer, so the size cannot be assumed.
+        let mut size = self.header.size();
 
         size += VarInt::from(self.txdata.len()).size();
         size += self.txdata.iter().map(|tx| tx.base_size()).sum::<usize>();
@@ -352,7 +789,8 @@ impl Block {
     /// > Total size is the block size in bytes with transactions serialized as described in BIP144,
     /// > including base data and witness data.
     pub fn total_size(&self) -> usize {
-        let mut size = Header::SIZE;
+        // An extended header is longer, so the size cannot be assumed.
+        let mut size = self.header.size();
 
         size += VarInt::from(self.txdata.len()).size();
         size += self.txdata.iter().map(|tx| tx.total_size()).sum::<usize>();
@@ -517,6 +955,7 @@ impl<'a> Arbitrary<'a> for Header {
             time: u.arbitrary()?,
             bits: CompactTarget::from_consensus(u.arbitrary()?),
             nonce: u.arbitrary()?,
+            v2: None,
         })
     }
 }
@@ -653,11 +1092,148 @@ mod tests {
         let real_decode = decode.unwrap();
         assert_eq!(real_decode.header.version, Version(2147483647));
 
-        let block2 = hex!("000000800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-        let decode2: Result<Block, _> = deserialize(&block2);
-        assert!(decode2.is_ok());
-        let real_decode2 = decode2.unwrap();
-        assert_eq!(real_decode2.header.version, Version(-2147483648));
+        // Past the BLAKE2b hardfork bit 31 of the version word announces the extended header
+        // form, so this 80 byte input is now a truncated 164 byte header rather than a block
+        // whose version happens to be negative.
+        let header2 = hex!("00000080000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+        assert!(deserialize::<Header>(&header2).is_err());
+    }
+
+    fn v2_header(height: i32, flags: u8) -> Header {
+        Header {
+            version: Version::ONE,
+            prev_blockhash: BlockHash::from_byte_array([0; 32]),
+            merkle_root: TxMerkleNode::from_byte_array([0; 32]),
+            time: 0,
+            bits: CompactTarget::from_consensus(0x1d00_ffff),
+            nonce: 0,
+            v2: Some(HeaderV2 {
+                nonce2: 0,
+                nonce3: 0,
+                extranonce: [0; 16],
+                time_offset: 0,
+                txcount: 1,
+                flags,
+                xor_key_mask_clear_bits: 0,
+                xor_key: [0; 16],
+                height,
+                mm_rhs: [0; 32],
+            }),
+        }
+    }
+
+    #[test]
+    fn validate_form_enforces_the_activation_height() {
+        let params = &Params::MAINNET;
+        assert_eq!(params.blake2b_height, Some(961_640));
+        assert_eq!(params.blake2b_target_shift, 22);
+
+        // Knots' bad-version-sha256d: an extended header may not claim a height below activation.
+        assert_eq!(v2_header(961_640, 0).validate_form(params), Ok(()));
+        assert_eq!(v2_header(961_641, 0).validate_form(params), Ok(()));
+        for height in [961_639, 0, -1, i32::MIN] {
+            assert_eq!(
+                v2_header(height, 0).validate_form(params),
+                Err(InvalidHeaderFormError::ExtendedHeaderTooEarly),
+                "height {}",
+                height
+            );
+        }
+
+        // Knots' bad-flags-highbits.
+        for flags in [0x40, 0x80, 0xc0] {
+            assert_eq!(
+                v2_header(961_640, flags).validate_form(params),
+                Err(InvalidHeaderFormError::ReservedFlags),
+                "flags {:#04x}",
+                flags
+            );
+        }
+
+        // Where the fork is not scheduled, an extended header has no valid height at all.
+        assert_eq!(
+            v2_header(961_640, 0).validate_form(&Params::SIGNET),
+            Err(InvalidHeaderFormError::ExtendedHeaderNotScheduled)
+        );
+
+        // A legacy header is unaffected on every network.
+        let v1 = Header { v2: None, ..v2_header(0, 0) };
+        assert_eq!(v1.validate_form(params), Ok(()));
+        assert_eq!(v1.validate_form(&Params::SIGNET), Ok(()));
+    }
+
+    #[test]
+    fn validate_form_at_height_enforces_the_flag_day() {
+        let params = &Params::MAINNET;
+
+        // Knots' bad-header-height: the header must agree with where the block sits.
+        assert_eq!(v2_header(961_640, 0).validate_form_at_height(961_640, params), Ok(()));
+        assert_eq!(
+            v2_header(961_641, 0).validate_form_at_height(961_640, params),
+            Err(InvalidHeaderFormError::HeightMismatch)
+        );
+
+        // Knots' bad-version-blake2b: a legacy header is refused from the activation height on.
+        let v1 = Header { v2: None, ..v2_header(0, 0) };
+        assert_eq!(v1.validate_form_at_height(961_639, params), Ok(()));
+        for height in [961_640, 1_000_000] {
+            assert_eq!(
+                v1.validate_form_at_height(height, params),
+                Err(InvalidHeaderFormError::LegacyHeaderTooLate),
+                "height {}",
+                height
+            );
+        }
+
+        // And a legacy header stays valid at any height where the fork is unscheduled.
+        assert_eq!(v1.validate_form_at_height(961_640, &Params::SIGNET), Ok(()));
+    }
+
+    #[test]
+    fn extended_header_counts_toward_block_size_and_weight() {
+        // The extended header is 84 bytes longer, and those bytes are base data, so they count
+        // four times over in the weight.
+        let segwit = include_bytes!("../../tests/data/testnet_block_000000000000045e0b1660b6445b5e5c5ab63c9a4f956be7e1e69be04fa4497b.raw").to_vec();
+        let v1: Block = deserialize(&segwit).unwrap();
+
+        let mut v2 = v1.clone();
+        v2.header.v2 = Some(HeaderV2 { txcount: 0, ..v2_header(840_000, 0).v2.unwrap() });
+
+        assert_eq!(v2.total_size(), v1.total_size() + HeaderV2::EXTRA_SIZE);
+        assert_eq!(v2.weight().to_wu(), v1.weight().to_wu() + 4 * HeaderV2::EXTRA_SIZE as u64);
+        assert_eq!(serialize(&v2).len(), segwit.len() + HeaderV2::EXTRA_SIZE);
+        assert_eq!(serialize(&v2).len(), v2.total_size());
+    }
+
+    #[test]
+    fn version_never_carries_the_extended_header_flag() {
+        // Bit 31 announces the header form, so it is not part of the version and no `Version` may
+        // hold it. Otherwise a v1 header built with such a version would serialize with the bit
+        // cleared and hash differently from the value it was constructed with.
+        assert_eq!(Version::from_consensus(i32::MIN), Version(0));
+        assert_eq!(Version::from_consensus(-1).to_consensus(), 0x7fff_ffff);
+        assert_eq!(Version::from_consensus(0x7fff_ffff).to_consensus(), 0x7fff_ffff);
+        assert_eq!(Version::from_consensus(2).to_consensus(), 2);
+    }
+
+    #[test]
+    fn header_encoding_round_trips_for_every_version() {
+        // The encoder masks bit 31, so the round trip is only total because `Version` cannot
+        // hold it.
+        for raw in [0, 1, 2, 0x2000_0000, 0x7fff_ffff, -1, i32::MIN, i32::MIN + 1] {
+            let header = Header {
+                version: Version::from_consensus(raw),
+                prev_blockhash: BlockHash::from_byte_array([0x99; 32]),
+                merkle_root: TxMerkleNode::from_byte_array([0x77; 32]),
+                time: 2,
+                bits: CompactTarget::from_consensus(3),
+                nonce: 4,
+                v2: None,
+            };
+            let bytes = serialize(&header);
+            assert_eq!(bytes.len(), Header::SIZE, "raw {}", raw);
+            assert_eq!(deserialize::<Header>(&bytes).unwrap(), header, "raw {}", raw);
+        }
     }
 
     #[test]
@@ -735,6 +1311,7 @@ mod tests {
             time: 0,
             bits: CompactTarget::from_consensus(0x1d00ffff),
             nonce: 0,
+            v2: None,
         };
 
         let mut block = Block { header, txdata: vec![coinbase] };

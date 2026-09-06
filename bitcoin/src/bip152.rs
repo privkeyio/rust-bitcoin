@@ -456,6 +456,7 @@ mod test {
                 time: 2,
                 bits: CompactTarget::from_consensus(3),
                 nonce: 4,
+                v2: None,
             },
             txdata: vec![dummy_tx(&[2]), dummy_tx(&[3]), dummy_tx(&[4])],
         }
