@@ -79,6 +79,7 @@ pub struct Header {
     /// The extra fields carried by an extended header, if this is one.
     ///
     /// `None` for the historical 80 byte form. See [`HeaderV2`].
+    #[cfg_attr(feature = "serde", serde(default))]
     pub v2: Option<HeaderV2>,
 }
 
@@ -582,9 +583,19 @@ impl std::error::Error for InvalidHeaderFormError {}
 /// * [BIP9 - Version bits with timeout and delay](https://github.com/bitcoin/bips/blob/master/bip-0009.mediawiki) (current usage)
 /// * [BIP34 - Block v2, Height in Coinbase](https://github.com/bitcoin/bips/blob/master/bip-0034.mediawiki)
 #[derive(Copy, PartialEq, Eq, Clone, Debug, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 #[cfg_attr(feature = "serde", serde(crate = "actual_serde"))]
 pub struct Version(i32);
+
+// `Deserialize` is hand written rather than derived so that the value goes through
+// `from_consensus` and cannot bring bit 31 in that way, bypassing the mask.
+#[cfg(feature = "serde")]
+impl<'de> actual_serde::Deserialize<'de> for Version {
+    fn deserialize<D: actual_serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = <i32 as actual_serde::Deserialize>::deserialize(d)?;
+        Ok(Version::from_consensus(v))
+    }
+}
 
 impl Version {
     /// The original Bitcoin Block v1.
@@ -1203,6 +1214,25 @@ mod tests {
         assert_eq!(v2.weight().to_wu(), v1.weight().to_wu() + 4 * HeaderV2::EXTRA_SIZE as u64);
         assert_eq!(serialize(&v2).len(), segwit.len() + HeaderV2::EXTRA_SIZE);
         assert_eq!(serialize(&v2).len(), v2.total_size());
+    }
+
+    #[test]
+    #[cfg(feature = "serde")]
+    fn version_masks_bit_31_when_deserialized() {
+        // The derived `Deserialize` would construct the newtype directly and bypass the mask, so
+        // a value could enter that way and then serialize and hash as something else.
+        let v: Version = serde_json::from_str("-2147483648").unwrap();
+        assert_eq!(v, Version::from_consensus(i32::MIN));
+        assert_eq!(v.to_consensus(), 0);
+
+        let v: Version = serde_json::from_str("-1").unwrap();
+        assert_eq!(v.to_consensus(), 0x7fff_ffff);
+
+        // Ordinary versions round-trip untouched.
+        for raw in [0i32, 1, 2, 0x2000_0000, 0x7fff_ffff] {
+            let v: Version = serde_json::from_str(&raw.to_string()).unwrap();
+            assert_eq!(v.to_consensus(), raw);
+        }
     }
 
     #[test]
