@@ -5,6 +5,7 @@
 //! Cryptography related functionality: keys and signatures.
 //!
 
+pub mod blake2b;
 pub mod ecdsa;
 pub mod key;
 pub mod sighash;
