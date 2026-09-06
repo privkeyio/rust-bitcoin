@@ -293,6 +293,21 @@ impl Block<Unchecked> {
             return Err(InvalidBlockError::InvalidCoinbase);
         }
 
+        if let Some(v2) = self.header.v2 {
+            // Knots' CheckBlockHeader: the top two bits of flags are reserved for a future
+            // hardfork, serving the same purpose that version bit 31 served for this one.
+            if v2.flags & HeaderV2::RESERVED_FLAGS != 0 {
+                return Err(InvalidBlockError::ReservedHeaderFlags);
+            }
+        }
+
+        // Knots' CheckMerkleRoot: an extended header commits to the transaction count, and a
+        // legacy header must leave it zero.
+        let txcount = self.header.v2.map_or(0, |v2| usize::from(v2.txcount));
+        if txcount != self.header.v2.map_or(0, |_| self.transactions.len()) {
+            return Err(InvalidBlockError::TransactionCountMismatch);
+        }
+
         if !self.check_merkle_root() {
             return Err(InvalidBlockError::InvalidMerkleRoot);
         }
@@ -865,6 +880,17 @@ impl Header {
         let hash = engine.finalize().to_byte_array();
 
         // Presumably the actual mining ASIC hardware sees these.
+        //
+        // Profiles 0, 2 and 3 end with the same five fields. Profile 1 deliberately swaps
+        // `nonce3` and `time_offset`, so it is written out separately below.
+        let tail = |engine: &mut blake2b::HashEngine| {
+            engine.input(&self.nonce.to_le_bytes());
+            engine.input(&v2.nonce2.to_le_bytes());
+            engine.input(&v2.time_offset.to_le_bytes());
+            engine.input(&v2.nonce3.to_le_bytes());
+            engine.input(&hash);
+        };
+
         let mut engine = blake2b::Hash::engine();
         match v2.asic_profile() {
             profile @ (2 | 3) => {
@@ -876,20 +902,12 @@ impl Header {
                 engine.input(&ZEROS);
                 engine.input(&ZEROS);
                 engine.input(&h2_hash);
-                engine.input(&self.nonce.to_le_bytes());
-                engine.input(&v2.nonce2.to_le_bytes());
-                engine.input(&v2.time_offset.to_le_bytes());
-                engine.input(&v2.nonce3.to_le_bytes());
-                engine.input(&hash);
+                tail(&mut engine);
             }
             0 => {
                 prev_blockhash_hidden[..6].fill(0);
                 engine.input(&prev_blockhash_hidden);
-                engine.input(&self.nonce.to_le_bytes());
-                engine.input(&v2.nonce2.to_le_bytes());
-                engine.input(&v2.time_offset.to_le_bytes());
-                engine.input(&v2.nonce3.to_le_bytes());
-                engine.input(&hash);
+                tail(&mut engine);
             }
             // The profile is `flags & 3`, so 1 is the only value left.
             _ => {
@@ -1026,7 +1044,8 @@ impl HeaderDecoder {
 
     /// Copies up to `needed - filled` bytes out of `bytes`, advancing it past what it consumed.
     fn take(&mut self, needed: usize, bytes: &mut &[u8]) {
-        let take = core::cmp::min(needed - self.filled, bytes.len());
+        debug_assert!(self.filled <= needed, "take called past the byte count it was given");
+        let take = core::cmp::min(needed.saturating_sub(self.filled), bytes.len());
         self.buf[self.filled..self.filled + take].copy_from_slice(&bytes[..take]);
         self.filled += take;
         *bytes = &bytes[take..];
@@ -1103,7 +1122,9 @@ impl encoding::Decoder for HeaderDecoder {
 
         let v2 = if self.needed == Some(Header::V2_SIZE) {
             let mut tail = ArrayDecoder::<{ HeaderV2::EXTRA_SIZE }>::new();
-            let mut extra = &self.buf[Header::SIZE..self.filled];
+            // `inner.end()` above already errored if fewer than `Header::SIZE` bytes arrived,
+            // but keep the bound local so this cannot panic if that ever changes.
+            let mut extra = &self.buf[Header::SIZE..self.filled.max(Header::SIZE)];
             let _ = tail.push_bytes(&mut extra).map_err(HeaderDecoderError::V2Fields)?;
             Some(HeaderV2::read_extra(&tail.end().map_err(HeaderDecoderError::V2Fields)?))
         } else {
@@ -1121,7 +1142,11 @@ impl encoding::Decoder for HeaderDecoder {
     }
 
     #[inline]
-    fn read_limit(&self) -> usize { self.needed.unwrap_or(4) - self.filled }
+    fn read_limit(&self) -> usize {
+        // Before the version word is read the form is unknown, but every header needs at least
+        // `Header::SIZE`, so asking for that much can never over-read.
+        self.needed.unwrap_or(Header::SIZE).saturating_sub(self.filled)
+    }
 }
 
 impl From<Header> for BlockHash {
@@ -1178,6 +1203,15 @@ impl HeaderV2 {
     /// Bit in [`HeaderV2::flags`] that makes [`HeaderV2::time_offset`] apply to the wire time.
     pub const USE_TIME_OFFSET: u8 = 4;
 
+    /// Bits of [`HeaderV2::flags`] reserved for a future hardfork.
+    ///
+    /// These serve the same purpose for a future format change that version bit 31 served for
+    /// this one, so a header that sets either of them must be rejected rather than hashed with
+    /// today's algorithm. See [`Block::validate`].
+    ///
+    /// [`Block::validate`]: crate::block::Block::validate
+    pub const RESERVED_FLAGS: u8 = 0xc0;
+
     /// The number of bytes an extended header adds to [`Header::SIZE`].
     // (nonce2, nonce3, extranonce, time_offset, txcount, flags, xor_key_mask_clear_bits, xor_key,
     // height, mm_rhs)
@@ -1230,9 +1264,27 @@ impl HeaderV2 {
 ///
 /// * [BIP-0009 - Version bits with timeout and delay](https://github.com/bitcoin/bips/blob/master/bip-0009.mediawiki) (current usage)
 /// * [BIP-0034 - Block v2, Height in Coinbase](https://github.com/bitcoin/bips/blob/master/bip-0034.mediawiki)
+///
+/// # Bit 31
+///
+/// Past the `BLAKE2b` proof-of-work hardfork bit 31 of the version word on the wire announces the
+/// extended header form (see [`HeaderV2`]) rather than belonging to the version, so a `Version`
+/// never carries it: every constructor masks it off. Bitcoin Knots does the same, in
+/// `CBlockHeader::GetCompleteVersion`.
 #[derive(Copy, PartialEq, Eq, Clone, Debug, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct Version(i32);
+
+// `Deserialize` is hand written rather than derived so that the value goes through
+// `from_consensus` and cannot bring bit 31 in with it.
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Version {
+    #[inline]
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Goes through `from_consensus` so that bit 31 cannot enter this way either.
+        Ok(Self::from_consensus(<i32 as serde::Deserialize>::deserialize(d)?))
+    }
+}
 
 impl Version {
     /// The original Bitcoin Block v1.
@@ -1255,8 +1307,17 @@ impl Version {
     /// Constructs a new [`Version`] from a signed 32 bit integer value.
     ///
     /// This is the data type used in consensus code in Bitcoin Core.
+    ///
+    /// Bit 31 is masked off: past the `BLAKE2b` hardfork it announces the extended header form
+    /// rather than belonging to the version, so `from_consensus(i32::MIN)` is [`Version::ZERO`].
     #[inline]
-    pub const fn from_consensus(v: i32) -> Self { Self(v) }
+    pub const fn from_consensus(v: i32) -> Self {
+        // The casts reinterpret the bits; `Version` is signed only for historical reasons.
+        Self((v as u32 & !Header::V2_VERSION_FLAG) as i32)
+    }
+
+    /// The zero version.
+    pub const ZERO: Self = Self(0);
 
     /// Returns the inner `i32` value.
     ///
@@ -1407,6 +1468,10 @@ pub mod error {
         NoTransactions,
         /// The first transaction is not a valid coinbase transaction.
         InvalidCoinbase,
+        /// The extended header's transaction count does not match the transaction list.
+        TransactionCountMismatch,
+        /// The extended header sets flag bits reserved for a future hardfork.
+        ReservedHeaderFlags,
     }
 
     #[cfg(feature = "alloc")]
@@ -1424,6 +1489,12 @@ pub mod error {
                     write!(f, "header Merkle root does not match the calculated Merkle root"),
                 Self::InvalidWitnessCommitment => write!(f, "the witness commitment in coinbase transaction does not match the calculated witness_root"),
                 Self::NoTransactions => write!(f, "block has no transactions (missing coinbase)"),
+                Self::TransactionCountMismatch => write!(
+                    f,
+                    "the extended header's transaction count does not match the transaction list"
+                ),
+                Self::ReservedHeaderFlags =>
+                    write!(f, "the extended header sets flag bits reserved for a future hardfork"),
                 Self::InvalidCoinbase =>
                     write!(f, "the first transaction is not a valid coinbase transaction"),
             }
@@ -1440,6 +1511,8 @@ pub mod error {
                 Self::InvalidWitnessCommitment => None,
                 Self::NoTransactions => None,
                 Self::InvalidCoinbase => None,
+                Self::TransactionCountMismatch => None,
+                Self::ReservedHeaderFlags => None,
             }
         }
     }
@@ -2702,6 +2775,112 @@ mod tests {
 
         let roundtrip: Adt = serde_json::from_str(&json).expect("failed to deserialize");
         assert_eq!(roundtrip, orig);
+    }
+
+    #[cfg(feature = "alloc")]
+    fn dummy_header_v2(txcount: u16, flags: u8) -> HeaderV2 {
+        HeaderV2 {
+            nonce2: 0,
+            nonce3: 0,
+            extranonce: [0; 16],
+            time_offset: 0,
+            txcount,
+            flags,
+            xor_key_mask_clear_bits: 0,
+            xor_key: [0; 16],
+            height: 840_000,
+            mm_rhs: [0; 32],
+        }
+    }
+
+    /// A block whose Merkle root and coinbase are valid, so `validate` reaches the header rules.
+    #[cfg(feature = "alloc")]
+    fn valid_block_with_v2(v2: Option<HeaderV2>) -> Block {
+        let (header, transactions) = dummy_block().into_parts();
+        let merkle_root = compute_merkle_root(&transactions).expect("non-empty");
+        Block::new_unchecked(Header { merkle_root, v2, ..header }, transactions)
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn validate_accepts_a_matching_transaction_count() {
+        // Sanity: the same block with no extended header, and with a correct count, both pass.
+        assert!(valid_block_with_v2(None).validate().is_ok());
+        let n = u16::try_from(dummy_block().transactions.len()).expect("small");
+        assert!(valid_block_with_v2(Some(dummy_header_v2(n, 0))).validate().is_ok());
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn validate_rejects_a_transaction_count_mismatch() {
+        // Knots' CheckMerkleRoot rejects this as bad-txnlist-size.
+        let n = u16::try_from(dummy_block().transactions.len()).expect("small");
+        for wrong in [0, n + 1, u16::MAX] {
+            if wrong == n {
+                continue;
+            }
+            assert_eq!(
+                valid_block_with_v2(Some(dummy_header_v2(wrong, 0))).validate().unwrap_err(),
+                InvalidBlockError::TransactionCountMismatch,
+                "txcount {}",
+                wrong
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn validate_rejects_reserved_header_flags() {
+        // Knots' CheckBlockHeader rejects these as bad-flags-highbits. They are reserved for a
+        // future format change, exactly as version bit 31 was reserved for this one.
+        let n = u16::try_from(dummy_block().transactions.len()).expect("small");
+        assert_eq!(HeaderV2::RESERVED_FLAGS, 0xc0);
+        for flags in [0x40, 0x80, 0xc0, 0xff] {
+            assert_eq!(
+                valid_block_with_v2(Some(dummy_header_v2(n, flags))).validate().unwrap_err(),
+                InvalidBlockError::ReservedHeaderFlags,
+                "flags {:#04x}",
+                flags
+            );
+        }
+        // Every flag below the reserved pair stays acceptable.
+        for flags in 0u8..0x40 {
+            assert!(
+                valid_block_with_v2(Some(dummy_header_v2(n, flags))).validate().is_ok(),
+                "flags {:#04x}",
+                flags
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn version_never_carries_the_extended_header_flag() {
+        // Bit 31 announces the header form, so it is not part of the version and no `Version`
+        // may hold it. Without this, a v1 header built with such a version would serialize with
+        // the bit cleared and hash differently from the value it was constructed with.
+        assert_eq!(Version::from_consensus(i32::MIN), Version::ZERO);
+        assert_eq!(Version::from_consensus(-1).to_consensus(), 0x7fff_ffff);
+        assert_eq!(Version::from_consensus(0x7fff_ffff).to_consensus(), 0x7fff_ffff);
+        assert_eq!(Version::from_consensus(2).to_consensus(), 2);
+
+        for raw in [i32::MIN, -1, -2, i32::MIN + 1] {
+            assert!(Version::from_consensus(raw).to_consensus() >= 0, "raw {}", raw);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn header_encoding_round_trips_for_every_version() {
+        // The encoder masks bit 31, so the round trip is only total because `Version` cannot
+        // hold it. Two fuzz targets assert this property.
+        for raw in [0, 1, 2, 0x2000_0000, 0x7fff_ffff, -1, i32::MIN, i32::MIN + 1] {
+            let header = Header { version: Version::from_consensus(raw), ..dummy_header() };
+            let bytes = encoding::encode_to_vec(&header);
+            assert_eq!(bytes.len(), Header::SIZE, "raw {}", raw);
+            let decoded: Header = encoding::decode_from_slice(&bytes).expect("decodes");
+            assert_eq!(decoded, header, "raw {}", raw);
+        }
     }
 
     #[test]

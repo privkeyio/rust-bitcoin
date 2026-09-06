@@ -350,7 +350,8 @@ mod tests {
             nonce3: 2,
             extranonce: [3; 16],
             time_offset: 0,
-            txcount: 4,
+            // An extended header commits to the transaction count, so it must match.
+            txcount: u16::try_from(v1.transactions().len()).unwrap(),
             flags: 0,
             xor_key_mask_clear_bits: 0,
             xor_key: [0; 16],

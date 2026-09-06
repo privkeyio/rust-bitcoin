@@ -31,6 +31,7 @@ fn main() {}
 ///   `TransactionDecoder` rejects zero-output transactions and transactions whose output
 ///   values sum to more than `MAX_MONEY`; the old decoder accepted both.
 fn is_known_decoder_divergence(err: &(dyn std::error::Error + 'static)) -> bool {
+    use bitcoin::block::error::HeaderDecoderError;
     use bitcoin::blockdata::transaction::TransactionDecoderError;
     use bitcoin_consensus_encoding::LengthPrefixExceedsMaxError;
     use p2p::message::error::CommandStringDecoderError;
@@ -47,6 +48,12 @@ fn is_known_decoder_divergence(err: &(dyn std::error::Error + 'static)) -> bool 
             return true;
         }
         if e.downcast_ref::<LengthPrefixExceedsMaxError>().is_some() {
+            return true;
+        }
+        // The BLAKE2b hardfork took version bit 31 for the header form. Bitcoin 0.32 predates
+        // that and reads such a header as 80 bytes, so it succeeds where we run out of input.
+        // `V2Fields` can only arise for a header that set that bit.
+        if matches!(e.downcast_ref::<HeaderDecoderError>(), Some(HeaderDecoderError::V2Fields(_))) {
             return true;
         }
         if e.downcast_ref::<TransactionDecoderError>().is_some_and(|e| {
@@ -73,6 +80,18 @@ macro_rules! compare_encoding {
     ($data:expr, $ty:ident) => {
         compare_encoding!($data, bitcoin::$ty, bitcoin_0_32::$ty);
     };
+
+    // Types whose encoding starts with a block header (or is a header version word).
+    //
+    // The BLAKE2b hardfork took bit 31 of the version word for the header form, so for input
+    // that sets it the two crates legitimately disagree: bitcoin 0.32 reads 80 bytes and keeps
+    // the bit in the version, we read 164 and keep the bit out of it. Everything else about
+    // these types is compared as usual.
+    ($data:expr, $new_ty:ty, $old_ty:ty, header_leading) => {{
+        if !leads_with_extended_header_flag($data) {
+            compare_encoding!($data, $new_ty, $old_ty);
+        }
+    }};
 
     // Types in submodules need this because we can't easily concatenate crate prefixes.
     ($data:expr, $new_ty:ty, $old_ty:ty) => {{
@@ -154,6 +173,30 @@ fn addrv2_payload_should_skip(data: &[u8]) -> bool {
     .unwrap_or(false)
 }
 
+/// Returns `true` if `data` leads with a version word that announces an extended block header.
+fn leads_with_extended_header_flag(data: &[u8]) -> bool {
+    data.get(..4)
+        .and_then(|v| <[u8; 4]>::try_from(v).ok())
+        .is_some_and(|v| u32::from_le_bytes(v) & 0x8000_0000 != 0)
+}
+
+/// Returns `true` if a `V1NetworkMessage` payload carries a block header that sets version bit 31.
+///
+/// The header sits right after the 24 byte message header for the commands that lead with one,
+/// and after a further compact-size count for `headers`. Only the single byte count is handled;
+/// a longer count means far more headers than a fuzz input will produce.
+fn v1_network_message_has_extended_header(data: &[u8]) -> bool {
+    let Some(command) = data.get(4..16).and_then(|c| std::str::from_utf8(c).ok()) else {
+        return false;
+    };
+    let offset = match command.trim_end_matches('\0') {
+        "block" | "cmpctblock" | "merkleblock" => 24,
+        "headers" if data.get(24).is_some_and(|n| *n < 0xfd) => 25,
+        _ => return false,
+    };
+    data.get(offset..).is_some_and(leads_with_extended_header_flag)
+}
+
 /// Returns `true` if `V1NetworkMessage` carries a command that only the master decodes.
 fn v1_network_message_should_skip(data: &[u8]) -> bool {
     const MASTER_ONLY: &[&str] = &["sendtxrcncl", "feature"];
@@ -166,7 +209,7 @@ fn v1_network_message_should_skip(data: &[u8]) -> bool {
 
 #[rustfmt::skip] // rustfmt butchers all of these with inconsistent newlines.
 fn do_test(data: &[u8]) {
-    compare_encoding!(data, Block);
+    compare_encoding!(data, bitcoin::Block, bitcoin_0_32::Block, header_leading);
     compare_encoding!(data, Transaction);
     compare_encoding!(data, TxIn);
     compare_encoding!(data, TxOut);
@@ -179,9 +222,9 @@ fn do_test(data: &[u8]) {
     compare_encoding!(data, TxMerkleNode);
     compare_encoding!(data, WitnessMerkleNode);
 
-    compare_encoding!(data, bitcoin::block::Header, bitcoin_0_32::block::Header);
+    compare_encoding!(data, bitcoin::block::Header, bitcoin_0_32::block::Header, header_leading);
     compare_encoding!(data, bitcoin::absolute::LockTime, bitcoin_0_32::absolute::LockTime);
-    compare_encoding!(data, bitcoin::block::Version, bitcoin_0_32::block::Version);
+    compare_encoding!(data, bitcoin::block::Version, bitcoin_0_32::block::Version, header_leading);
     compare_encoding!(data, bitcoin::transaction::Version, bitcoin_0_32::transaction::Version);
     compare_encoding!(data, bitcoin::taproot_primitives::TapLeafHash, bitcoin_0_32::TapLeafHash);
 
@@ -191,10 +234,10 @@ fn do_test(data: &[u8]) {
     compare_encoding!(data, p2p::address::Address, bitcoin_0_32::p2p::address::Address);
     compare_encoding!(data, p2p::bip152::BlockTransactions, bitcoin_0_32::bip152::BlockTransactions);
     compare_encoding!(data, p2p::bip152::BlockTransactionsRequest, bitcoin_0_32::bip152::BlockTransactionsRequest);
-    compare_encoding!(data, p2p::bip152::HeaderAndShortIds, bitcoin_0_32::bip152::HeaderAndShortIds);
+    compare_encoding!(data, p2p::bip152::HeaderAndShortIds, bitcoin_0_32::bip152::HeaderAndShortIds, header_leading);
     compare_encoding!(data, p2p::bip152::PrefilledTransaction, bitcoin_0_32::bip152::PrefilledTransaction);
     compare_encoding!(data, p2p::bip152::ShortId, bitcoin_0_32::bip152::ShortId);
-    compare_encoding!(data, p2p::merkle_tree::MerkleBlock, bitcoin_0_32::MerkleBlock);
+    compare_encoding!(data, p2p::merkle_tree::MerkleBlock, bitcoin_0_32::MerkleBlock, header_leading);
     compare_encoding!(data, p2p::merkle_tree::PartialMerkleTree, bitcoin_0_32::merkle_tree::PartialMerkleTree);
     compare_encoding!(data, p2p::message_blockdata::GetBlocksMessage, bitcoin_0_32::p2p::message_blockdata::GetBlocksMessage);
     compare_encoding!(data, p2p::message_blockdata::GetHeadersMessage, bitcoin_0_32::p2p::message_blockdata::GetHeadersMessage);
@@ -218,12 +261,12 @@ fn do_test(data: &[u8]) {
     compare_encoding!(data, p2p::ProtocolVersion, u32);
     compare_encoding!(data, p2p::address::AddrV1Message, (u32, bitcoin_0_32::p2p::Address));
     compare_encoding!(data, p2p::message::AddrPayload, Vec<(u32, bitcoin_0_32::p2p::Address)>);
-    compare_encoding!(data, p2p::message::NetworkHeader, (bitcoin_0_32::block::Header, u8));
+    compare_encoding!(data, p2p::message::NetworkHeader, (bitcoin_0_32::block::Header, u8), header_leading);
     compare_encoding!(data, p2p::message::Ping, u64);
     compare_encoding!(data, p2p::message::Pong, u64);
     // Skip messages unknown to bitcoin 0.32, which never fails them, while master
     // decoder parses can recognize and reject them.
-    if !v1_network_message_should_skip(data) {
+    if !v1_network_message_should_skip(data) && !v1_network_message_has_extended_header(data) {
         compare_encoding!(data, p2p::message::V1NetworkMessage, bitcoin_0_32::p2p::message::RawNetworkMessage);
     }
     compare_encoding!(data, p2p::message_blockdata::BlockLocator, Vec<bitcoin_0_32::BlockHash>);
