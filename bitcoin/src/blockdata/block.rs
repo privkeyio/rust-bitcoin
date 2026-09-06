@@ -22,7 +22,8 @@ use crate::{internal_macros, Target, ToU64, Weight, Work};
 pub use primitives::block::{
     Block, BlockDecoder, BlockEncoder, BlockHash, BlockHashDecoder, BlockHashEncoder,
     Checked, Unchecked, Validation, Version, VersionDecoder, VersionEncoder, Header,
-    HeaderDecoder, HeaderEncoder, WitnessCommitment, compute_merkle_root, compute_witness_root,
+    HeaderDecoder, HeaderEncoder, HeaderV2, WitnessCommitment, compute_merkle_root,
+    compute_witness_root,
 };
 #[doc(inline)]
 pub use units::block::{
@@ -139,12 +140,13 @@ impl BlockCheckedExt for Block<Checked> {
 
     fn weight(&self) -> Weight {
         // This is the exact definition of a weight unit, as defined by BIP-0141 (quote above).
-        let wu = block_base_size(self.transactions()) * 3 + self.total_size();
+        let wu = block_base_size(self.header(), self.transactions()) * 3 + self.total_size();
         Weight::from_wu(wu.to_u64())
     }
 
     fn total_size(&self) -> usize {
-        let mut size = Header::SIZE;
+        // An extended header is longer, so the size cannot be assumed.
+        let mut size = self.header().size();
 
         size += CompactSizeEncoder::encoded_size(self.transactions().len());
         size += self.transactions().iter().map(|tx| tx.total_size()).sum::<usize>();
@@ -189,8 +191,8 @@ impl BlockCheckedExt for Block<Checked> {
     }
 }
 
-fn block_base_size(transactions: &[Transaction]) -> usize {
-    let mut size = Header::SIZE;
+fn block_base_size(header: &Header, transactions: &[Transaction]) -> usize {
+    let mut size = header.size();
 
     size += CompactSizeEncoder::encoded_size(transactions.len());
     size += transactions.iter().map(|tx| tx.base_size()).sum::<usize>();
@@ -329,6 +331,45 @@ mod tests {
     };
 
     #[test]
+    fn extended_header_counts_toward_block_size_and_weight() {
+        // Same block twice, once with a legacy header and once with an extended one. The extended
+        // header is 84 bytes longer, and those bytes are part of the block's base data, so they
+        // count four times over in the weight.
+        let segwit_block = include_bytes!("../../tests/data/testnet_block_000000000000045e0b1660b6445b5e5c5ab63c9a4f956be7e1e69be04fa4497b.raw").to_vec();
+        let v1: Block = decode_from_slice(&segwit_block).unwrap();
+        let v1 = v1.assume_checked(None);
+
+        let (header, transactions) = {
+            let (h, t) =
+                Block::new_unchecked(*v1.header(), v1.transactions().to_vec()).into_parts();
+            (h, t)
+        };
+        let mut v2_header = header;
+        v2_header.v2 = Some(block::HeaderV2 {
+            nonce2: 1,
+            nonce3: 2,
+            extranonce: [3; 16],
+            time_offset: 0,
+            txcount: 4,
+            flags: 0,
+            xor_key_mask_clear_bits: 0,
+            xor_key: [0; 16],
+            height: 5,
+            mm_rhs: [6; 32],
+        });
+        let v2 = Block::new_unchecked(v2_header, transactions).assume_checked(None);
+
+        assert_eq!(v2.total_size(), v1.total_size() + block::HeaderV2::EXTRA_SIZE);
+        assert_eq!(
+            v2.weight().to_wu(),
+            v1.weight().to_wu() + 4 * block::HeaderV2::EXTRA_SIZE as u64
+        );
+        // And the serialized block really is that much longer.
+        assert_eq!(encode_to_vec(&v2).len(), segwit_block.len() + block::HeaderV2::EXTRA_SIZE);
+        assert_eq!(encode_to_vec(&v2).len(), v2.total_size());
+    }
+
+    #[test]
     fn coinbase_and_bip34() {
         // testnet block 100,000
         const BLOCK_HEX: &str = "0200000035ab154183570282ce9afc0b494c9fc6a3cfea05aa8c1add2ecc56490000000038ba3d78e4500a5a7570dbe61960398add4410d278b21cd9708e6d9743f374d544fc055227f1001c29c1ea3b0101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff3703a08601000427f1001c046a510100522cfabe6d6d0000000000000000000068692066726f6d20706f6f6c7365727665726aac1eeeed88ffffffff0100f2052a010000001976a914912e2b234f941f30b18afbb4fa46171214bf66c888ac00000000";
@@ -423,7 +464,10 @@ mod tests {
             real_decode.block_hash()
         );
         assert_eq!(real_decode.total_size(), some_block.len());
-        assert_eq!(block_base_size(real_decode.transactions()), some_block.len());
+        assert_eq!(
+            block_base_size(real_decode.header(), real_decode.transactions()),
+            some_block.len()
+        );
         assert_eq!(real_decode.weight(), Weight::from_vb_unchecked(some_block.len().to_u64()));
 
         assert_eq!(encode_to_vec(&real_decode), some_block);
@@ -470,7 +514,7 @@ mod tests {
             real_decode.block_hash()
         );
         assert_eq!(real_decode.total_size(), segwit_block.len());
-        assert_eq!(block_base_size(real_decode.transactions()), 4283);
+        assert_eq!(block_base_size(real_decode.header(), real_decode.transactions()), 4283);
         assert_eq!(real_decode.weight(), Weight::from_wu(17168));
 
         assert_eq!(encode_to_vec(&real_decode), segwit_block);
