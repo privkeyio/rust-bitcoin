@@ -466,6 +466,7 @@ mod tests {
             time: BlockTime::from_u32(1599332177),
             bits: epoch_start.bits,
             nonce: epoch_start.nonce,
+            v2: None,
         };
         let adjustment =
             CompactTarget::from_header_difficulty_adjustment(epoch_start, current, params);
@@ -488,6 +489,7 @@ mod tests {
             time: BlockTime::from_u32(1599332844),
             bits: starting_bits,
             nonce: 0,
+            v2: None,
         };
 
         // Block 4031, the only information used are `bits` and `time`
@@ -498,6 +500,7 @@ mod tests {
             time: BlockTime::from_u32(1600591200),
             bits: starting_bits,
             nonce: 0,
+            v2: None,
         };
         let adjustment =
             CompactTarget::from_header_difficulty_adjustment(epoch_start, current, params);
@@ -565,6 +568,7 @@ mod tests {
             time: start_time,
             bits: bits_start,
             nonce: 0,
+            v2: None,
         };
 
         let current = Header {
@@ -574,6 +578,7 @@ mod tests {
             time: end_time,
             bits: bits_end,
             nonce: 0,
+            v2: None,
         };
 
         // Test mainnet (enforce_bip94 = false): should use current.bits
@@ -669,6 +674,7 @@ mod tests {
             time: 0x651b_c919.into(), // 2023-10-03 18:56:09 GMT +11 -> 1696359369 -> 651BC919
             bits: CompactTarget::from_consensus(0x1704_ed7f),
             nonce: 0xc637_a163,
+            v2: None,
         }
     }
 
@@ -696,6 +702,7 @@ mod tests {
                 time: 0x6509_64b5.into(), // 2023-09-19 09:07:01 GMT -> 1695114421 -> 650964B5
                 bits: CompactTarget::from_consensus(0x1704_ed7f),
                 nonce: 0x82d6_8990,
+                v2: None,
             })
         }
 
@@ -771,6 +778,7 @@ mod tests {
             time: current_time.into(),
             bits: pow_limit, // Current header has pow_limit
             nonce: 0,
+            v2: None,
         };
 
         // New block timestamp is within 20 minutes
@@ -788,6 +796,7 @@ mod tests {
                 time: (current_time - 600).into(),
                 bits: want,
                 nonce: 0,
+                v2: None,
             })
         };
 

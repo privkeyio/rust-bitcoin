@@ -277,7 +277,7 @@ struct Default {
 struct Encoders<'a> {
     a: block::BlockEncoder<'a>,
     b: block::BlockHashEncoder<'a>,
-    c: block::HeaderEncoder<'a>,
+    c: block::HeaderEncoder,
     d: block::VersionEncoder<'a>,
     e: merkle_tree::TxMerkleNodeEncoder<'a>,
     f: script::ScriptEncoder<'a>,

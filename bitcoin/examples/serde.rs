@@ -44,5 +44,6 @@ fn dummy_header() -> Header {
         time: BlockTime::from(2),
         bits: CompactTarget::from_consensus(3),
         nonce: 4,
+        v2: None,
     }
 }

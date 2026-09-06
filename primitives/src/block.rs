@@ -45,6 +45,7 @@
 //!     time: BlockTime::from_u32(1_231_006_505),
 //!     bits: CompactTarget::from_consensus(0x1d00_ffff),
 //!     nonce: 2_083_236_893,
+//!     v2: None,
 //! };
 //! assert_eq!(Header::SIZE, 80);
 //!
@@ -76,9 +77,7 @@ use arbitrary::{Arbitrary, Unstructured};
 use encoding::{ArrayDecoder, Decoder6};
 #[cfg(feature = "alloc")]
 use encoding::{Decoder2, Encoder2, PrefixedSliceEncoder, VecDecoder};
-use hashes::sha256d;
-#[cfg(feature = "alloc")]
-use hashes::HashEngine as _;
+use hashes::{blake2b, sha256, sha256d, HashEngine as _};
 
 #[cfg(feature = "hex")]
 use crate::hex_codec::HexPrimitive;
@@ -193,6 +192,7 @@ impl Block<Unchecked> {
     /// #     time: BlockTime::from_u32(1_231_006_505),
     /// #     bits: CompactTarget::from_consensus(0x1d00_ffff),
     /// #     nonce: 0,
+    /// #     v2: None,
     /// # };
     /// // This header's Merkle root does not match the transaction list.
     /// let block = Block::new_unchecked(header, vec![coinbase]);
@@ -266,6 +266,7 @@ impl Block<Unchecked> {
     /// #         time: BlockTime::from_u32(1_231_006_505),
     /// #         bits: CompactTarget::from_consensus(0x1d00_ffff),
     /// #         nonce: 0,
+    /// #         v2: None,
     /// #     }
     /// # }
     /// let transactions = vec![coinbase];
@@ -366,6 +367,7 @@ impl Block<Unchecked> {
     /// #     time: BlockTime::from_u32(1_231_006_505),
     /// #     bits: CompactTarget::from_consensus(0x1d00_ffff),
     /// #     nonce: 0,
+    /// #     v2: None,
     /// # };
     /// // This block's only transaction has an empty witness.
     /// let block = Block::new_unchecked(header, vec![coinbase]);
@@ -571,7 +573,7 @@ encoding::encoder_newtype! {
     /// The encoder for the [`Block`] type.
     #[derive(Debug, Clone)]
     pub struct BlockEncoder<'e>(
-        Encoder2<HeaderEncoder<'e>, PrefixedSliceEncoder<'e, Transaction>>
+        Encoder2<HeaderEncoder, PrefixedSliceEncoder<'e, Transaction>>
     );
 }
 
@@ -682,12 +684,22 @@ pub struct Header {
     pub bits: CompactTarget,
     /// The nonce, selected to obtain a low enough blockhash.
     pub nonce: u32,
+    /// The extra fields carried by an extended header, if this is one.
+    ///
+    /// `None` for the historical 80 byte form. See [`HeaderV2`].
+    pub v2: Option<HeaderV2>,
 }
 
 impl Header {
     /// The number of bytes that the block header contributes to the size of a block.
     // Serialized length of fields (version, prev_blockhash, merkle_root, time, bits, nonce)
     pub const SIZE: usize = 4 + 32 + 32 + 4 + 4 + 4; // 80
+
+    /// The number of bytes that an extended block header contributes to the size of a block.
+    pub const V2_SIZE: usize = Self::SIZE + HeaderV2::EXTRA_SIZE; // 164
+
+    /// Bit of the version word that announces the extended header form.
+    pub const V2_VERSION_FLAG: u32 = 0x8000_0000;
 
     /// Returns the block hash.
     ///
@@ -705,6 +717,7 @@ impl Header {
     ///     time: BlockTime::from_u32(1_231_006_505),
     ///     bits: CompactTarget::from_consensus(0x1d00_ffff),
     ///     nonce: 0,
+    ///     v2: None,
     /// };
     /// let block_hash = header.block_hash();
     ///
@@ -713,8 +726,190 @@ impl Header {
     /// ```
     #[inline]
     pub fn block_hash(&self) -> BlockHash {
-        let hash = hashes::encode_to_hash::<_, sha256d::HashEngine>(self);
-        BlockHash::from_byte_array(hash.to_byte_array())
+        match self.v2 {
+            None => {
+                let hash = hashes::encode_to_hash::<_, sha256d::HashEngine>(self);
+                BlockHash::from_byte_array(hash.to_byte_array())
+            }
+            Some(ref v2) => self.block_hash_v2(v2),
+        }
+    }
+
+    /// Returns the serialized size of this header, in bytes.
+    ///
+    /// Either [`Header::SIZE`] or [`Header::V2_SIZE`].
+    #[inline]
+    pub const fn size(&self) -> usize {
+        match self.v2 {
+            None => Self::SIZE,
+            Some(_) => Self::V2_SIZE,
+        }
+    }
+
+    /// Returns the version word as it appears on the wire.
+    ///
+    /// This is [`Header::version`] with [`Header::V2_VERSION_FLAG`] set if and only if this is an
+    /// extended header. A version bit 31 set in [`Header::version`] itself is masked off, because
+    /// past the hardfork that bit no longer belongs to the version.
+    #[inline]
+    pub const fn complete_version(&self) -> u32 {
+        // The cast reinterprets the bits; `Version` is signed only for historical reasons.
+        let base = self.version.to_consensus() as u32 & !Self::V2_VERSION_FLAG;
+        match self.v2 {
+            None => base,
+            Some(_) => base | Self::V2_VERSION_FLAG,
+        }
+    }
+
+    /// Returns the timestamp as it appears on the wire.
+    ///
+    /// [`Header::time`] holds the effective block time. An extended header may carry part of it in
+    /// [`HeaderV2::time_offset`] instead, in which case the wire form holds the difference.
+    #[inline]
+    pub const fn time_on_wire(&self) -> u32 {
+        match self.v2 {
+            Some(v2) if v2.flags & HeaderV2::USE_TIME_OFFSET != 0 =>
+                self.time.to_u32().wrapping_sub(v2.time_offset),
+            _ => self.time.to_u32(),
+        }
+    }
+
+    /// Serializes the header, returning the buffer and the number of bytes used.
+    fn wire_bytes(&self) -> ([u8; Self::V2_SIZE], usize) {
+        let mut out = [0u8; Self::V2_SIZE];
+        out[0..4].copy_from_slice(&self.complete_version().to_le_bytes());
+        out[4..36].copy_from_slice(&self.prev_blockhash.to_byte_array());
+        out[36..68].copy_from_slice(&self.merkle_root.to_byte_array());
+        out[68..72].copy_from_slice(&self.time_on_wire().to_le_bytes());
+        out[72..76].copy_from_slice(&self.bits.to_consensus_u32().to_le_bytes());
+        out[76..80].copy_from_slice(&self.nonce.to_le_bytes());
+        match self.v2 {
+            None => (out, Self::SIZE),
+            Some(ref v2) => {
+                v2.write_extra(
+                    <&mut [u8; HeaderV2::EXTRA_SIZE]>::try_from(&mut out[Self::SIZE..])
+                        .expect("EXTRA_SIZE bytes"),
+                );
+                (out, Self::V2_SIZE)
+            }
+        }
+    }
+
+    /// Computes the `BLAKE2b` block id of an extended header.
+    ///
+    /// Follows Bitcoin Knots' `CBlockHeader::GetHash` for the extended form: a chain of BIP-340
+    /// style tagged SHA256 hashes feeding two `BLAKE2b` passes, the second laid out according to the
+    /// ASIC profile in the header flags, then masked and byte reversed.
+    fn block_hash_v2(&self, v2: &HeaderV2) -> BlockHash {
+        /// BIP-340 style tagged hash engine, seeded with `sha256(tag)` twice.
+        fn tagged(tag: &[u8]) -> sha256::HashEngine {
+            let tag_hash = sha256::Hash::hash(tag);
+            let mut engine = sha256::Hash::engine();
+            engine.input(tag_hash.as_byte_array());
+            engine.input(tag_hash.as_byte_array());
+            engine
+        }
+
+        const ZEROS: [u8; 16] = [0; 16];
+
+        // The pooling miner only learns the XOR key once it finds a block, so the header commits
+        // to the key's hash rather than the key.
+        let mut engine = tagged(b"Bitcoin block hash PoW XOR key");
+        engine.input(&v2.xor_key);
+        let xor_key_hash = engine.finalize();
+
+        let mut xor_key_mask = [0u8; 32];
+        if v2.xor_key != ZEROS {
+            let mut engine = tagged(b"Bitcoin block hash PoW XOR mask");
+            engine.input(&v2.xor_key);
+            xor_key_mask = engine.finalize().to_byte_array();
+            // `xor_key_mask_clear_bits` is a `u8`, so this is at most 31 and stays in bounds.
+            let clear_bytes = usize::from(v2.xor_key_mask_clear_bits / 8);
+            xor_key_mask[..clear_bytes].fill(0);
+            xor_key_mask[clear_bytes] &= 0xff_u8 >> (v2.xor_key_mask_clear_bits % 8);
+        }
+
+        let mut prev_blockhash = self.prev_blockhash.to_byte_array();
+        prev_blockhash.reverse();
+
+        let mut engine = tagged(b"Bitcoin prevblock header, hashed");
+        engine.input(&prev_blockhash);
+        let mut prev_blockhash_hidden = engine.finalize().to_byte_array();
+
+        // These fields are invisible to the mining machine, so the hasher cannot brick itself at
+        // some future block version, time or difficulty.
+        let mut h1 = tagged(b"Bitcoin block header 1");
+        h1.input(&self.complete_version().to_le_bytes());
+        h1.input(&prev_blockhash);
+        h1.input(&v2.height.to_le_bytes());
+        h1.input(&self.merkle_root.to_byte_array());
+        h1.input(&self.time_on_wire().to_le_bytes());
+        h1.input(&[0]); // Reserved for an extended 40 bit time.
+        h1.input(&self.bits.to_consensus_u32().to_le_bytes());
+        h1.input(&u32::from(v2.txcount).to_le_bytes());
+        h1.input(&[v2.flags, v2.xor_key_mask_clear_bits]);
+        h1.input(xor_key_hash.as_byte_array());
+
+        let mut h2 = tagged(b"Merge-mining hook");
+        h2.input(h1.finalize().as_byte_array());
+        h2.input(&ZEROS);
+        h2.input(&ZEROS);
+        h2.input(&v2.mm_rhs);
+        let h2_hash = h2.finalize().to_byte_array();
+
+        // These fields get sent to mining machines over Stratum v1.
+        let mut engine = blake2b::Hash::engine();
+        engine.input(&0_u32.to_le_bytes()); // Sv1 "coinb1", less the implied first byte.
+        engine.input(&h2_hash);
+        engine.input(&v2.extranonce);
+        let hash = engine.finalize().to_byte_array();
+
+        // Presumably the actual mining ASIC hardware sees these.
+        let mut engine = blake2b::Hash::engine();
+        match v2.asic_profile() {
+            profile @ (2 | 3) => {
+                if profile == 3 {
+                    engine.input(&ZEROS);
+                    engine.input(&ZEROS);
+                }
+                engine.input(&ZEROS);
+                engine.input(&ZEROS);
+                engine.input(&ZEROS);
+                engine.input(&h2_hash);
+                engine.input(&self.nonce.to_le_bytes());
+                engine.input(&v2.nonce2.to_le_bytes());
+                engine.input(&v2.time_offset.to_le_bytes());
+                engine.input(&v2.nonce3.to_le_bytes());
+                engine.input(&hash);
+            }
+            0 => {
+                prev_blockhash_hidden[..6].fill(0);
+                engine.input(&prev_blockhash_hidden);
+                engine.input(&self.nonce.to_le_bytes());
+                engine.input(&v2.nonce2.to_le_bytes());
+                engine.input(&v2.time_offset.to_le_bytes());
+                engine.input(&v2.nonce3.to_le_bytes());
+                engine.input(&hash);
+            }
+            // The profile is `flags & 3`, so 1 is the only value left.
+            _ => {
+                engine.input(&self.nonce.to_le_bytes());
+                engine.input(&v2.nonce2.to_le_bytes());
+                engine.input(&v2.nonce3.to_le_bytes());
+                engine.input(&v2.time_offset.to_le_bytes());
+                engine.input(&hash);
+                engine.input(&h2_hash);
+            }
+        }
+        let hash = engine.finalize().to_byte_array();
+
+        // Knots writes the masked digest into the block id back to front. That is exactly the
+        // order `BlockHash` stores its bytes in, so the displayed id reads the digest forwards.
+        let mut out = [0u8; 32];
+        for (i, byte) in hash.iter().enumerate() {
+            out[31 - i] = byte ^ xor_key_mask[i];
+        }
+        BlockHash::from_byte_array(out)
     }
 }
 
@@ -761,23 +956,18 @@ impl fmt::Debug for Header {
             .field("time", &self.time)
             .field("bits", &self.bits)
             .field("nonce", &self.nonce)
+            .field("v2", &self.v2)
             .finish()
     }
 }
 
 impl encoding::Encode for Header {
-    type Encoder<'e> = HeaderEncoder<'e>;
+    type Encoder<'e> = HeaderEncoder;
 
     #[inline]
     fn encoder(&self) -> Self::Encoder<'_> {
-        HeaderEncoder::new(encoding::Encoder6::new(
-            self.version.encoder(),
-            self.prev_blockhash.encoder(),
-            self.merkle_root.encoder(),
-            self.time.encoder(),
-            self.bits.encoder(),
-            encoding::ArrayEncoder::without_length_prefix(self.nonce.to_le_bytes()),
-        ))
+        let (buf, len) = self.wire_bytes();
+        HeaderEncoder { buf, len }
     }
 }
 
@@ -785,19 +975,27 @@ impl encoding::Decode for Header {
     type Decoder = HeaderDecoder;
 }
 
-encoding::encoder_newtype_exact! {
-    /// The encoder for the [`Header`] type.
-    #[derive(Debug, Clone)]
-    pub struct HeaderEncoder<'e>(
-        encoding::Encoder6<
-            VersionEncoder<'e>,
-            BlockHashEncoder<'e>,
-            crate::merkle_tree::TxMerkleNodeEncoder<'e>,
-            crate::time::BlockTimeEncoder<'e>,
-            crate::pow::CompactTargetEncoder<'e>,
-            encoding::ArrayEncoder<4>,
-        >
-    );
+/// The encoder for the [`Header`] type.
+///
+/// A header is either [`Header::SIZE`] or [`Header::V2_SIZE`] bytes, so unlike the other fixed
+/// width primitives this encoder carries its own buffer rather than composing field encoders.
+#[derive(Debug, Clone)]
+pub struct HeaderEncoder {
+    buf: [u8; Header::V2_SIZE],
+    len: usize,
+}
+
+impl encoding::Encoder for HeaderEncoder {
+    #[inline]
+    fn current_chunk(&self) -> &[u8] { &self.buf[..self.len] }
+
+    #[inline]
+    fn advance(&mut self) -> encoding::EncoderStatus { encoding::EncoderStatus::Finished }
+}
+
+impl encoding::ExactSizeEncoder for HeaderEncoder {
+    #[inline]
+    fn len(&self) -> usize { self.len }
 }
 
 type HeaderInnerDecoder = Decoder6<
@@ -806,40 +1004,34 @@ type HeaderInnerDecoder = Decoder6<
     TxMerkleNodeDecoder,
     BlockTimeDecoder,
     CompactTargetDecoder,
-    encoding::ArrayDecoder<4>, // Nonce
+    ArrayDecoder<4>, // Nonce
 >;
 
-crate::decoder_newtype! {
-    /// The decoder for the [`Header`] type.
-    #[derive(Debug, Clone)]
-    pub struct HeaderDecoder(HeaderInnerDecoder);
-
-    /// Constructs a new [`Header`] decoder.
-    pub const fn new() -> Self {
-        Self(Decoder6::new(
-            VersionDecoder::new(),
-            BlockHashDecoder::new(),
-            TxMerkleNodeDecoder::new(),
-            BlockTimeDecoder::new(),
-            CompactTargetDecoder::new(),
-            ArrayDecoder::new(),
-        ))
-    }
-
-    fn map_push_bytes_err(err: <HeaderInnerDecoder as encoding::Decoder>::Error) -> HeaderDecoderError {
-        Self::from_inner(err)
-    }
-
-    fn end(
-        result: Result<<HeaderInnerDecoder as encoding::Decoder>::Output, <HeaderInnerDecoder as encoding::Decoder>::Error>
-    ) -> Result<Header, HeaderDecoderError> {
-        let (version, prev_blockhash, merkle_root, time, bits, nonce) = result.map_err(Self::from_inner)?;
-        let nonce = u32::from_le_bytes(nonce);
-        Ok(Header { version, prev_blockhash, merkle_root, time, bits, nonce })
-    }
+/// The decoder for the [`Header`] type.
+///
+/// The wire form is self-describing: bit 31 of the version word says whether 80 or
+/// [`Header::V2_SIZE`] bytes follow, so the length is only known after the first four bytes.
+#[derive(Debug, Clone)]
+pub struct HeaderDecoder {
+    buf: [u8; Header::V2_SIZE],
+    filled: usize,
+    /// Total bytes this header needs. `None` until the version word has been read.
+    needed: Option<usize>,
 }
 
 impl HeaderDecoder {
+    /// Constructs a new [`Header`] decoder.
+    #[inline]
+    pub const fn new() -> Self { Self { buf: [0; Header::V2_SIZE], filled: 0, needed: None } }
+
+    /// Copies up to `needed - filled` bytes out of `bytes`, advancing it past what it consumed.
+    fn take(&mut self, needed: usize, bytes: &mut &[u8]) {
+        let take = core::cmp::min(needed - self.filled, bytes.len());
+        self.buf[self.filled..self.filled + take].copy_from_slice(&bytes[..take]);
+        self.filled += take;
+        *bytes = &bytes[take..];
+    }
+
     #[inline]
     fn from_inner(e: <HeaderInnerDecoder as encoding::Decoder>::Error) -> HeaderDecoderError {
         match e {
@@ -853,6 +1045,85 @@ impl HeaderDecoder {
     }
 }
 
+impl Default for HeaderDecoder {
+    #[inline]
+    fn default() -> Self { Self::new() }
+}
+
+impl encoding::Decoder for HeaderDecoder {
+    type Output = Header;
+    type Error = HeaderDecoderError;
+
+    fn push_bytes(&mut self, bytes: &mut &[u8]) -> Result<encoding::DecoderStatus, Self::Error> {
+        // The version word decides the length, so it has to be read before anything else.
+        if self.needed.is_none() {
+            self.take(4, bytes);
+            if self.filled < 4 {
+                return Ok(encoding::DecoderStatus::NeedsMore);
+            }
+            let version = u32::from_le_bytes(self.buf[..4].try_into().expect("4 bytes"));
+            self.needed = Some(if version & Header::V2_VERSION_FLAG != 0 {
+                Header::V2_SIZE
+            } else {
+                Header::SIZE
+            });
+        }
+
+        let needed = self.needed.expect("set just above");
+        self.take(needed, bytes);
+        if self.filled < needed {
+            Ok(encoding::DecoderStatus::NeedsMore)
+        } else {
+            Ok(encoding::DecoderStatus::Ready)
+        }
+    }
+
+    fn end(self) -> Result<Self::Output, Self::Error> {
+        // Replay the base 80 bytes through the field decoders so that a truncated header reports
+        // the field it was truncated in, exactly as it did before extended headers existed.
+        let mut inner = HeaderInnerDecoder::new(
+            VersionDecoder::new(),
+            BlockHashDecoder::new(),
+            TxMerkleNodeDecoder::new(),
+            BlockTimeDecoder::new(),
+            CompactTargetDecoder::new(),
+            ArrayDecoder::new(),
+        );
+        let mut base = &self.buf[..core::cmp::min(self.filled, Header::SIZE)];
+        let _ = inner.push_bytes(&mut base).map_err(Self::from_inner)?;
+        let (version, prev_blockhash, merkle_root, time, bits, nonce) =
+            inner.end().map_err(Self::from_inner)?;
+        let nonce = u32::from_le_bytes(nonce);
+
+        // Past the hardfork bit 31 announces the header form rather than belonging to the version.
+        // The cast reinterprets the bits; `Version` is signed only for historical reasons.
+        let version = Version::from_consensus(
+            (version.to_consensus() as u32 & !Header::V2_VERSION_FLAG) as i32,
+        );
+
+        let v2 = if self.needed == Some(Header::V2_SIZE) {
+            let mut tail = ArrayDecoder::<{ HeaderV2::EXTRA_SIZE }>::new();
+            let mut extra = &self.buf[Header::SIZE..self.filled];
+            let _ = tail.push_bytes(&mut extra).map_err(HeaderDecoderError::V2Fields)?;
+            Some(HeaderV2::read_extra(&tail.end().map_err(HeaderDecoderError::V2Fields)?))
+        } else {
+            None
+        };
+
+        let mut header = Header { version, prev_blockhash, merkle_root, time, bits, nonce, v2 };
+        // `time` on the wire is the effective time less the offset, when the offset is in use.
+        if let Some(v2) = header.v2 {
+            if v2.flags & HeaderV2::USE_TIME_OFFSET != 0 {
+                header.time = BlockTime::from_u32(time.to_u32().wrapping_add(v2.time_offset));
+            }
+        }
+        Ok(header)
+    }
+
+    #[inline]
+    fn read_limit(&self) -> usize { self.needed.unwrap_or(4) - self.filled }
+}
+
 impl From<Header> for BlockHash {
     #[inline]
     fn from(header: Header) -> Self { header.block_hash() }
@@ -861,6 +1132,89 @@ impl From<Header> for BlockHash {
 impl From<&Header> for BlockHash {
     #[inline]
     fn from(header: &Header) -> Self { header.block_hash() }
+}
+
+/// The extra fields carried by an extended (164 byte) block header.
+///
+/// After the `BLAKE2b` proof-of-work hardfork a header may carry 84 bytes beyond the historical 80.
+/// The extended form is announced by bit 31 of the header's version word, so a header is
+/// self-describing and nothing keys off the block height. Below the activation height headers stay
+/// 80 bytes and byte identical to what they always were.
+///
+/// The blob fields are held in wire (little endian) byte order, the same way [`BlockHash`] holds
+/// its bytes.
+///
+/// # Bitcoin Core References
+///
+/// * [CBlockHeader definition](https://github.com/bitcoinknots/bitcoin/blob/v29.4.1.knots20260508/src/primitives/block.h)
+#[derive(Copy, PartialEq, Eq, Clone, PartialOrd, Ord, Hash, Debug)]
+pub struct HeaderV2 {
+    /// Second nonce, ground directly by the mining hardware.
+    pub nonce2: u32,
+    /// Third nonce, ground directly by the mining hardware.
+    pub nonce3: u32,
+    /// Stratum v1 extranonce.
+    pub extranonce: [u8; 16],
+    /// Amount added to the time on the wire to obtain [`Header::time`].
+    ///
+    /// Only applied when [`HeaderV2::USE_TIME_OFFSET`] is set in [`HeaderV2::flags`], but the
+    /// field is always present on the wire and always committed to by the block hash.
+    pub time_offset: u32,
+    /// Number of transactions in the block.
+    pub txcount: u16,
+    /// Header flags. The low two bits select the ASIC layout profile used by the block hash.
+    pub flags: u8,
+    /// Number of leading bits of the XOR mask to clear.
+    pub xor_key_mask_clear_bits: u8,
+    /// Proof-of-work XOR key.
+    pub xor_key: [u8; 16],
+    /// Height of this block.
+    pub height: i32,
+    /// Right hand side of the merge-mining hook.
+    pub mm_rhs: [u8; 32],
+}
+
+impl HeaderV2 {
+    /// Bit in [`HeaderV2::flags`] that makes [`HeaderV2::time_offset`] apply to the wire time.
+    pub const USE_TIME_OFFSET: u8 = 4;
+
+    /// The number of bytes an extended header adds to [`Header::SIZE`].
+    // (nonce2, nonce3, extranonce, time_offset, txcount, flags, xor_key_mask_clear_bits, xor_key,
+    // height, mm_rhs)
+    pub const EXTRA_SIZE: usize = 4 + 4 + 16 + 4 + 2 + 1 + 1 + 16 + 4 + 32; // 84
+
+    /// Returns the ASIC layout profile, which selects how the second `BLAKE2b` input is laid out.
+    #[inline]
+    pub const fn asic_profile(&self) -> u8 { self.flags & 3 }
+
+    fn write_extra(&self, out: &mut [u8; Self::EXTRA_SIZE]) {
+        out[0..4].copy_from_slice(&self.nonce2.to_le_bytes());
+        out[4..8].copy_from_slice(&self.nonce3.to_le_bytes());
+        out[8..24].copy_from_slice(&self.extranonce);
+        out[24..28].copy_from_slice(&self.time_offset.to_le_bytes());
+        out[28..30].copy_from_slice(&self.txcount.to_le_bytes());
+        out[30] = self.flags;
+        out[31] = self.xor_key_mask_clear_bits;
+        out[32..48].copy_from_slice(&self.xor_key);
+        out[48..52].copy_from_slice(&self.height.to_le_bytes());
+        out[52..84].copy_from_slice(&self.mm_rhs);
+    }
+
+    fn read_extra(buf: &[u8; Self::EXTRA_SIZE]) -> Self {
+        // Every slice below is a fixed sub-range of a fixed size array, so no conversion can fail.
+        Self {
+            nonce2: u32::from_le_bytes(buf[0..4].try_into().expect("4 bytes")),
+            nonce3: u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes")),
+            extranonce: buf[8..24].try_into().expect("16 bytes"),
+            time_offset: u32::from_le_bytes(buf[24..28].try_into().expect("4 bytes")),
+            txcount: u16::from_le_bytes(buf[28..30].try_into().expect("2 bytes")),
+            flags: buf[30],
+            xor_key_mask_clear_bits: buf[31],
+            xor_key: buf[32..48].try_into().expect("16 bytes"),
+            height: i32::from_le_bytes(buf[48..52].try_into().expect("4 bytes")),
+            mm_rhs: buf[52..84].try_into().expect("32 bytes"),
+        }
+    }
 }
 
 /// Bitcoin block version number.
@@ -1108,6 +1462,8 @@ pub mod error {
         Bits(CompactTargetDecoderError),
         /// Error while decoding the `nonce`.
         Nonce(encoding::UnexpectedEofError),
+        /// Error while decoding the extended header fields.
+        V2Fields(encoding::UnexpectedEofError),
     }
 
     impl From<Infallible> for HeaderDecoderError {
@@ -1125,6 +1481,7 @@ pub mod error {
                 Self::Time(ref e) => write_err!(f, "header decoder error"; e),
                 Self::Bits(ref e) => write_err!(f, "header decoder error"; e),
                 Self::Nonce(ref e) => write_err!(f, "header decoder error"; e),
+                Self::V2Fields(ref e) => write_err!(f, "header decoder error"; e),
             }
         }
     }
@@ -1140,6 +1497,7 @@ pub mod error {
                 Self::Time(ref e) => Some(e),
                 Self::Bits(ref e) => Some(e),
                 Self::Nonce(ref e) => Some(e),
+                Self::V2Fields(ref e) => Some(e),
             }
         }
     }
@@ -1191,6 +1549,26 @@ impl<'a> Arbitrary<'a> for Header {
             time: u.arbitrary()?,
             bits: CompactTarget::from_consensus(u.arbitrary()?),
             nonce: u.arbitrary()?,
+            v2: u.arbitrary()?,
+        })
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl<'a> Arbitrary<'a> for HeaderV2 {
+    #[inline]
+    fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(Self {
+            nonce2: u.arbitrary()?,
+            nonce3: u.arbitrary()?,
+            extranonce: u.arbitrary()?,
+            time_offset: u.arbitrary()?,
+            txcount: u.arbitrary()?,
+            flags: u.arbitrary()?,
+            xor_key_mask_clear_bits: u.arbitrary()?,
+            xor_key: u.arbitrary()?,
+            height: u.arbitrary()?,
+            mm_rhs: u.arbitrary()?,
         })
     }
 }
@@ -1240,6 +1618,7 @@ mod tests {
             time: BlockTime::from(2),
             bits: CompactTarget::from_consensus(3),
             nonce: 4,
+            v2: None,
         }
     }
 
@@ -1595,14 +1974,15 @@ mod tests {
     fn header_debug() {
         let header = dummy_header();
         let expected = format!(
-            "Header {{ block_hash: {:?}, version: {:?}, prev_blockhash: {:?}, merkle_root: {:?}, time: {:?}, bits: {:?}, nonce: {:?} }}",
+            "Header {{ block_hash: {:?}, version: {:?}, prev_blockhash: {:?}, merkle_root: {:?}, time: {:?}, bits: {:?}, nonce: {:?}, v2: {:?} }}",
             header.block_hash(),
             header.version,
             header.prev_blockhash,
             header.merkle_root,
             header.time,
             header.bits,
-            header.nonce
+            header.nonce,
+            header.v2
         );
         assert_eq!(format!("{:?}", header), expected);
     }
@@ -1620,6 +2000,7 @@ mod tests {
             time: BlockTime::from(seconds),
             bits: CompactTarget::from_consensus(0xbeef),
             nonce: 0xcafe,
+            v2: None,
         };
 
         let want = concat!(
@@ -1728,6 +2109,7 @@ mod tests {
             time: BlockTime::from(1_742_979_600), // 26 Mar 2025 9:00 UTC
             bits: CompactTarget::from_consensus(12_345_678),
             nonce: 1024,
+            v2: None,
         };
 
         let block: u32 = 741_521;
@@ -2347,10 +2729,10 @@ mod tests {
         let real_decode = decode.unwrap().assume_checked(None);
         assert_eq!(real_decode.header().version, Version::from_consensus(2_147_483_647));
 
-        let block2 = hex!("000000800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
-        let decode2: Result<Block<Unchecked>, _> = encoding::decode_from_slice(&block2);
-        assert!(decode2.is_ok());
-        let real_decode2 = decode2.unwrap().assume_checked(None);
-        assert_eq!(real_decode2.header().version, Version::from_consensus(-2_147_483_648));
+        // Past the BLAKE2b hardfork bit 31 of the version word announces the extended header
+        // form, so this 80 byte input is now a truncated 164 byte header rather than a block
+        // whose version happens to be negative.
+        let header2 = hex!("00000080000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000");
+        assert!(encoding::decode_from_slice::<Header>(&header2).is_err());
     }
 }

@@ -57,6 +57,7 @@ fn do_test((outputs, prevouts): (Vec<ScriptPubKeyBuf>, Vec<ScriptPubKeyBuf>)) {
         time: BlockTime::from_u32(0),
         bits: CompactTarget::from_consensus(0),
         nonce: 0,
+        v2: None,
     };
     let block = Block::new_unchecked(header, vec![coinbase, spending]).assume_checked(None);
     let block_hash = block.block_hash();

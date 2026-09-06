@@ -1549,7 +1549,7 @@ impl NetworkHeader {
 encoding::encoder_newtype_exact! {
     /// The encoder type for a [`NetworkHeader`].
     #[derive(Debug, Clone)]
-    pub struct NetworkHeaderEncoder<'e>(Encoder2<HeaderEncoder<'e>, ArrayEncoder<1>>);
+    pub struct NetworkHeaderEncoder<'e>(Encoder2<HeaderEncoder, ArrayEncoder<1>>);
 }
 
 impl encoding::Encode for NetworkHeader {

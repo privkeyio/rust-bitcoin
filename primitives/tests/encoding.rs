@@ -184,6 +184,7 @@ fn encode_block() {
         time: BlockTime::from(seconds),
         bits: CompactTarget::from_consensus(0xbeef),
         nonce: 0xcafe,
+        v2: None,
     };
 
     let tx = Transaction {

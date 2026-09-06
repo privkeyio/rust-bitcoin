@@ -129,7 +129,7 @@ impl MerkleBlock {
 encoding::encoder_newtype! {
     /// The encoder type for a [`MerkleBlock`].
     #[derive(Debug, Clone)]
-    pub struct MerkleBlockEncoder<'e>(Encoder2<HeaderEncoder<'e>, PartialMerkleTreeEncoder<'e>>);
+    pub struct MerkleBlockEncoder<'e>(Encoder2<HeaderEncoder, PartialMerkleTreeEncoder<'e>>);
 }
 
 impl encoding::Encode for MerkleBlock {
