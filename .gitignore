@@ -14,3 +14,8 @@ bitcoin/dep_test
 # Fuzz artifacts
 hfuzz_target
 hfuzz_workspace
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
