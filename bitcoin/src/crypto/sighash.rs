@@ -70,6 +70,55 @@ sha256t_hash_newtype! {
 
 impl_message_from_hash!(TapSighash);
 
+sha256t_hash_newtype! {
+    pub struct UnifiedSighashTag = hash_str("UnifiedSighash");
+
+    /// Tagged hash with tag \"UnifiedSighash\".
+    ///
+    /// This hash type is used for computing the unified opt-in signature hash.
+    #[hash_newtype(forward)]
+    pub struct UnifiedSighash(_);
+}
+
+impl_message_from_hash!(UnifiedSighash);
+
+/// The hash type bit that opts a signature in to the unified signature hash.
+pub const SIGHASH_UNIFIED: u8 = 0x20;
+
+/// The spend being signed under the unified signature hash, with the data its script type commits to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnifiedSpend<'s> {
+    /// A bare or P2SH spend, committing to its script code.
+    Base(&'s Script),
+    /// A segwit version 0 spend, committing to its script code.
+    SegwitV0(&'s Script),
+    /// A taproot key path spend.
+    TaprootKeyPath {
+        /// The annex, if the witness carries one.
+        annex: Option<Annex<'s>>,
+    },
+    /// A tapscript spend.
+    Tapscript {
+        /// The annex, if the witness carries one.
+        annex: Option<Annex<'s>>,
+        /// The leaf hash, as BIP341 defines it.
+        leaf_hash: TapLeafHash,
+        /// The last executed `OP_CODESEPARATOR` position, `0xFFFFFFFF` if none.
+        code_separator_pos: u32,
+    },
+}
+
+impl UnifiedSpend<'_> {
+    fn script_type(&self) -> u8 {
+        match self {
+            UnifiedSpend::Base(_) => 0,
+            UnifiedSpend::SegwitV0(_) => 1,
+            UnifiedSpend::TaprootKeyPath { .. } => 2,
+            UnifiedSpend::Tapscript { .. } => 3,
+        }
+    }
+}
+
 /// Efficiently calculates signature hash message for legacy, segwit and taproot inputs.
 #[derive(Debug)]
 pub struct SighashCache<T: Borrow<Transaction>> {
@@ -771,6 +820,121 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
         )
         .map_err(SigningDataError::unwrap_sighash)?;
         Ok(TapSighash::from_engine(enc))
+    }
+
+    /// Encodes the unified opt-in signing data into a given object implementing the
+    /// [`io::Write`] trait.
+    ///
+    /// `sighash_type` must have [`SIGHASH_UNIFIED`] set. Taproot and tapscript spends accept only
+    /// `SIGHASH_ALL`, `SIGHASH_NONE` and `SIGHASH_SINGLE`, with or without `SIGHASH_ANYONECANPAY`.
+    pub fn unified_encode_signing_data_to<W: Write + ?Sized, T: Borrow<TxOut>>(
+        &mut self,
+        writer: &mut W,
+        input_index: usize,
+        prevouts: &Prevouts<T>,
+        spend: UnifiedSpend,
+        sighash_type: u8,
+    ) -> Result<(), SigningDataError<TaprootError>> {
+        let base = sighash_type & 0x1f;
+        let anyone_can_pay = sighash_type & 0x80 != 0;
+        let taproot =
+            matches!(&spend, UnifiedSpend::TaprootKeyPath { .. } | UnifiedSpend::Tapscript { .. });
+        if sighash_type & SIGHASH_UNIFIED == 0
+            || (taproot && (sighash_type & !(0x80 | SIGHASH_UNIFIED | 3) != 0 || base == 0))
+        {
+            return Err(SigningDataError::Sighash(TaprootError::InvalidSighashType(
+                sighash_type.into(),
+            )));
+        }
+        prevouts.check_all(self.tx.borrow()).map_err(SigningDataError::sighash)?;
+        let txin = self.tx.borrow().tx_in(input_index).map_err(SigningDataError::sighash)?.clone();
+
+        0u8.consensus_encode(writer)?;
+        sighash_type.consensus_encode(writer)?;
+        self.tx.borrow().version.consensus_encode(writer)?;
+        // The locktime is committed to in five bytes, the fifth zero.
+        writer.write_all(
+            &u64::from(self.tx.borrow().lock_time.to_consensus_u32()).to_le_bytes()[..5],
+        )?;
+
+        if !anyone_can_pay {
+            self.common_cache().prevouts.consensus_encode(writer)?;
+            self.taproot_cache(prevouts.get_all().map_err(SigningDataError::sighash)?)
+                .amounts
+                .consensus_encode(writer)?;
+            self.taproot_cache(prevouts.get_all().map_err(SigningDataError::sighash)?)
+                .script_pubkeys
+                .consensus_encode(writer)?;
+            self.common_cache().sequences.consensus_encode(writer)?;
+        }
+
+        if base != 2 && base != 3 {
+            self.common_cache().outputs.consensus_encode(writer)?;
+        }
+
+        spend.script_type().consensus_encode(writer)?;
+
+        if anyone_can_pay {
+            let previous_output = prevouts.get(input_index).map_err(SigningDataError::sighash)?;
+            txin.previous_output.consensus_encode(writer)?;
+            previous_output.consensus_encode(writer)?;
+            txin.sequence.consensus_encode(writer)?;
+        } else {
+            (input_index as u32).consensus_encode(writer)?;
+        }
+
+        match &spend {
+            UnifiedSpend::Base(script_code) | UnifiedSpend::SegwitV0(script_code) => {
+                script_code.consensus_encode(writer)?;
+            }
+            UnifiedSpend::TaprootKeyPath { annex } | UnifiedSpend::Tapscript { annex, .. } => {
+                u8::from(annex.is_some()).consensus_encode(writer)?;
+                if let Some(annex) = annex {
+                    let mut enc = sha256::Hash::engine();
+                    annex.consensus_encode(&mut enc)?;
+                    sha256::Hash::from_engine(enc).consensus_encode(writer)?;
+                }
+            }
+        }
+
+        if base == 3 {
+            let mut enc = sha256::Hash::engine();
+            self.tx
+                .borrow()
+                .output
+                .get(input_index)
+                .ok_or(TaprootError::SingleMissingOutput(SingleMissingOutputError {
+                    input_index,
+                    outputs_length: self.tx.borrow().output.len(),
+                }))
+                .map_err(SigningDataError::Sighash)?
+                .consensus_encode(&mut enc)?;
+            sha256::Hash::from_engine(enc).consensus_encode(writer)?;
+        }
+
+        if let UnifiedSpend::Tapscript { leaf_hash, code_separator_pos, .. } = spend {
+            leaf_hash.as_byte_array().consensus_encode(writer)?;
+            KEY_VERSION_0.consensus_encode(writer)?;
+            code_separator_pos.consensus_encode(writer)?;
+        }
+
+        Ok(())
+    }
+
+    /// Computes the unified opt-in signature hash.
+    ///
+    /// See [`SighashCache::unified_encode_signing_data_to`] for the accepted hash types.
+    pub fn unified_signature_hash<T: Borrow<TxOut>>(
+        &mut self,
+        input_index: usize,
+        prevouts: &Prevouts<T>,
+        spend: UnifiedSpend,
+        sighash_type: u8,
+    ) -> Result<UnifiedSighash, TaprootError> {
+        let mut enc = UnifiedSighash::engine();
+        self.unified_encode_signing_data_to(&mut enc, input_index, prevouts, spend, sighash_type)
+            .map_err(SigningDataError::unwrap_sighash)?;
+        Ok(UnifiedSighash::from_engine(enc))
     }
 
     /// Encodes the BIP143 signing data for any flag type into a given object implementing the
@@ -1567,6 +1731,108 @@ mod tests {
             let expected_sighash = t.get(4).unwrap().as_str().unwrap();
             run_test_sighash(tx, script, input_index as usize, hash_type, expected_sighash);
         }
+    }
+
+    #[test]
+    fn unified_sighash_knots_vectors() {
+        // Bitcoin Knots' vectors (MIT), src/test/data/unified_sighash.json at 54d757f269.
+        let data = include_str!("../../tests/data/unified_sighash.json");
+        let vectors =
+            serde_json::from_str::<serde_json::Value>(data).unwrap().as_array().unwrap().clone();
+        assert_eq!(vectors.len() - 1, 166);
+        for v in vectors.iter().skip(1) {
+            let script_code = ScriptBuf::from_hex(v[0].as_str().unwrap()).unwrap();
+            let tx: Transaction =
+                deserialize(&Vec::from_hex(v[1].as_str().unwrap()).unwrap()).unwrap();
+            let input_index = v[2].as_u64().unwrap() as usize;
+            let sighash_type = v[3].as_u64().unwrap() as u8;
+            let spent: Vec<TxOut> = v[5]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|o| TxOut {
+                    value: Amount::from_sat(o[0].as_u64().unwrap()),
+                    script_pubkey: ScriptBuf::from_hex(o[1].as_str().unwrap()).unwrap(),
+                })
+                .collect();
+            let spend = match v[4].as_u64().unwrap() {
+                0 => UnifiedSpend::Base(&script_code),
+                1 => UnifiedSpend::SegwitV0(&script_code),
+                2 => UnifiedSpend::TaprootKeyPath { annex: None },
+                _ => UnifiedSpend::Tapscript {
+                    annex: None,
+                    leaf_hash: ScriptPath::with_defaults(&script_code).leaf_hash(),
+                    code_separator_pos: 0xFFFFFFFF,
+                },
+            };
+            let mut cache = SighashCache::new(&tx);
+            let got = cache
+                .unified_signature_hash(
+                    input_index,
+                    &Prevouts::All(&spent),
+                    spend.clone(),
+                    sighash_type,
+                )
+                .unwrap();
+            assert_eq!(
+                got.to_byte_array().to_vec(),
+                Vec::from_hex(v[6].as_str().unwrap()).unwrap()
+            );
+
+            // Without the opt-in bit, with the wrong prevout count, or past the inputs, it fails.
+            assert!(cache
+                .unified_signature_hash(
+                    input_index,
+                    &Prevouts::All(&spent),
+                    spend.clone(),
+                    sighash_type & !SIGHASH_UNIFIED
+                )
+                .is_err());
+            assert!(cache
+                .unified_signature_hash(
+                    input_index,
+                    &Prevouts::All(&spent[1..]),
+                    spend.clone(),
+                    sighash_type
+                )
+                .is_err());
+            assert!(cache
+                .unified_signature_hash(tx.input.len(), &Prevouts::All(&spent), spend, sighash_type)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn unified_sighash_rejects_undefined_taproot_types() {
+        let tx = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn::default()],
+            output: vec![TxOut::NULL],
+        };
+        let spent = [TxOut::NULL];
+        let mut cache = SighashCache::new(&tx);
+        let key_path = UnifiedSpend::TaprootKeyPath { annex: None };
+        for ht in [0x20u8, 0x24, 0x60, 0xa0, 0x30] {
+            assert!(cache
+                .unified_signature_hash(0, &Prevouts::All(&spent), key_path.clone(), ht)
+                .is_err());
+        }
+        for ht in [0x21u8, 0x22, 0x23, 0xa1, 0xa2, 0xa3] {
+            assert!(cache
+                .unified_signature_hash(0, &Prevouts::All(&spent), key_path.clone(), ht)
+                .is_ok());
+        }
+        // Script types 0 and 1 commit to any byte, as the legacy algorithm does.
+        let script = ScriptBuf::new();
+        assert!(cache
+            .unified_signature_hash(
+                0,
+                &Prevouts::All(&spent),
+                UnifiedSpend::SegwitV0(&script),
+                0x24
+            )
+            .is_ok());
     }
 
     #[test]

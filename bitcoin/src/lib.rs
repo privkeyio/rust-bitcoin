@@ -137,7 +137,10 @@ pub use crate::{
     consensus::params,
     crypto::ecdsa,
     crypto::key::{self, PrivateKey, PubkeyHash, PublicKey, CompressedPublicKey, WPubkeyHash, XOnlyPublicKey},
-    crypto::sighash::{self, LegacySighash, SegwitV0Sighash, TapSighash, TapSighashTag},
+    crypto::sighash::{
+        self, LegacySighash, SegwitV0Sighash, TapSighash, TapSighashTag, UnifiedSighash,
+        UnifiedSighashTag,
+    },
     merkle_tree::MerkleBlock,
     network::{Network, NetworkKind},
     pow::{CompactTarget, Target, Work},
