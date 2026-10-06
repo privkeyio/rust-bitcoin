@@ -89,8 +89,13 @@ pub const SIGHASH_UNIFIED: u8 = 0x20;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnifiedSpend<'s> {
     /// A bare or P2SH spend, committing to its script code.
+    ///
+    /// The script code is the final one: after the last executed `OP_CODESEPARATOR`, with the
+    /// legacy signature removal applied.
     Base(&'s Script),
     /// A segwit version 0 spend, committing to its script code.
+    ///
+    /// For P2WPKH this is the implied P2PKH script, see [`Script::p2wpkh_script_code`].
     SegwitV0(&'s Script),
     /// A taproot key path spend.
     TaprootKeyPath {
@@ -847,7 +852,7 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
             )));
         }
         prevouts.check_all(self.tx.borrow()).map_err(SigningDataError::sighash)?;
-        let txin = self.tx.borrow().tx_in(input_index).map_err(SigningDataError::sighash)?.clone();
+        self.tx.borrow().tx_in(input_index).map_err(SigningDataError::sighash)?;
 
         0u8.consensus_encode(writer)?;
         sighash_type.consensus_encode(writer)?;
@@ -875,6 +880,7 @@ impl<R: Borrow<Transaction>> SighashCache<R> {
         spend.script_type().consensus_encode(writer)?;
 
         if anyone_can_pay {
+            let txin = &self.tx.borrow().tx_in(input_index).map_err(SigningDataError::sighash)?;
             let previous_output = prevouts.get(input_index).map_err(SigningDataError::sighash)?;
             txin.previous_output.consensus_encode(writer)?;
             previous_output.consensus_encode(writer)?;
@@ -1778,6 +1784,15 @@ mod tests {
                 got.to_byte_array().to_vec(),
                 Vec::from_hex(v[6].as_str().unwrap()).unwrap()
             );
+            if sighash_type & 0x80 != 0 {
+                let one = Prevouts::One(input_index, spent[input_index].clone());
+                assert_eq!(
+                    cache
+                        .unified_signature_hash(input_index, &one, spend.clone(), sighash_type)
+                        .unwrap(),
+                    got
+                );
+            }
 
             // Without the opt-in bit, with the wrong prevout count, or past the inputs, it fails.
             assert!(cache
@@ -1823,6 +1838,23 @@ mod tests {
                 .unified_signature_hash(0, &Prevouts::All(&spent), key_path.clone(), ht)
                 .is_ok());
         }
+        // SIGHASH_SINGLE needs an output at the input's index.
+        let two_in = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn::default(), TxIn::default()],
+            output: vec![TxOut::NULL],
+        };
+        let spent_two = [TxOut::NULL, TxOut::NULL];
+        let mut two_cache = SighashCache::new(&two_in);
+        assert!(matches!(
+            two_cache.unified_signature_hash(1, &Prevouts::All(&spent_two), key_path.clone(), 0x23),
+            Err(TaprootError::SingleMissingOutput(_))
+        ));
+        assert!(two_cache
+            .unified_signature_hash(0, &Prevouts::All(&spent_two), key_path.clone(), 0x23)
+            .is_ok());
+
         // Script types 0 and 1 commit to any byte, as the legacy algorithm does.
         let script = ScriptBuf::new();
         assert!(cache
