@@ -10,6 +10,7 @@ This is an unofficial fork of [rust-bitcoin](https://github.com/rust-bitcoin/rus
 - **BLAKE2b block ids.** `Header::block_hash()` dispatches: SHA256d for the legacy form, and for the extended form the tagged-hash pipeline and two BLAKE2b passes that Bitcoin Knots uses, laid out by the ASIC profile in the header flags. BLAKE2b-256 is implemented in `bitcoin::crypto::blake2b` rather than in `bitcoin_hashes`, so a downstream user patches one crate rather than two.
 - **Bit 31 is no longer part of the version.** `Version::from_consensus` masks it off, by every construction path including `Deserialize`, so a header cannot be built that serializes as something other than the value it was made from.
 - **Size and weight read the header's real length.** A block carrying an extended header is 84 bytes and 336 weight units larger, which matters because weight gates validity.
+- **The unified opt-in signature hash.** `SighashCache::unified_signature_hash` computes the digest a signature commits to when its hash type sets `SIGHASH_UNIFIED` (`0x20`), as Bitcoin Knots defines it, for bare, P2SH, segwit v0, taproot key path and tapscript spends. It is checked against Knots' 166 vectors. Producing a signature in this form is left to the caller, since `EcdsaSighashType` cannot carry the bit.
 - **Header form validation.** `Header::validate_form` and `validate_form_at_height` carry the four rules Knots enforces, so a header syncing client can apply them without building a `Block`.
 
 ## Branches
